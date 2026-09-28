@@ -120,6 +120,10 @@ def test_datasource_warning_counts_outsiders(tmp_path):
     w = datasource_warnings(d, {"int@example.com", "m@example.com", "x@y.z"},
                             {"int@example.com", "m@example.com"}, {"main"})
     assert w and w[0].startswith("1 account(s)")
+    only_scoped = datasource_warnings(d, {"a@b.c"}, {"a@b.c"}, {"main"})
+    assert len(only_scoped) == 1 and "rows behind boards it cannot open" in only_scoped[0], \
+        "a board-only viewer can read the other boards' rows: always said"
+    d.folders[0].boards[0].viewers = []
     assert datasource_warnings(d, {"a@b.c"}, {"a@b.c"}, {"main"}) == []
 
 

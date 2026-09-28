@@ -3,7 +3,7 @@
 Deploy Grafana boards and decide who sees them, from one declaration per repo.
 
 ```bash
-pip install "boardkit @ git+https://github.com/tzDeFi/boardkit@v0.1.0"
+pip install "boardkit @ git+https://github.com/tzDeFi/boardkit@v0.1.1"
 boardkit plan   boards.toml      # validate; show the groups it will make
 boardkit deploy boards.toml      # ship to the audience's host and apply there
 ```

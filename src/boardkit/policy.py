@@ -43,11 +43,23 @@ def host_errors(decl: Declaration, host, settings: dict) -> list[str]:
 
 def datasource_warnings(decl: Declaration, org_emails: set[str], viewers: set[str],
                         logical: set[str]) -> list[str]:
+    """Who can read a sensitive project's data WITHOUT being allowed its boards.
+
+    Two groups, both real on Grafana OSS: accounts outside the project, and a
+    board's own viewers, who can query the rows behind every OTHER board on the
+    same datasource (one client reading another's book)."""
     if decl.sensitivity != "sensitive" or not logical:
         return []
+    out = []
     outside = sorted(org_emails - viewers)
-    if not outside:
-        return []
-    return [f"{len(outside)} account(s) outside this project's viewers can query its "
-            f"datasource(s) {sorted(logical)} with hand-written SQL (Grafana OSS). "
-            "Isolate with a per-audience org or a row-restricted database role."]
+    if outside:
+        out.append(f"{len(outside)} account(s) outside this project's viewers can query its "
+                   f"datasource(s) {sorted(logical)} with hand-written SQL (Grafana OSS). "
+                   "Isolate with a per-audience org or a row-restricted database role.")
+    scoped = [b for _, b in decl.boards() if b.viewers]
+    if scoped and len(list(decl.boards())) > 1:
+        out.append(f"{len(scoped)} board-only viewer group(s) share datasource(s) "
+                   f"{sorted(logical)} with the project's other boards: each can query the "
+                   "rows behind boards it cannot open. Give each audience its own org with a "
+                   "database role that sees only its rows.")
+    return out
