@@ -49,21 +49,24 @@ def carry_over_variables(g: Grafana, board: dict, only=None) -> list[str]:
         if not was or "current" not in was:
             continue
         value = was["current"].get("value")
+        picked = value if isinstance(value, list) else [value]      # multi-select: a list
+        opts = var.get("options") or []
         if var.get("type") == "textbox":
             var["options"] = [{"selected": True, "text": was["current"].get("text", value),
                                "value": value}]
-        else:
-            legal = {o.get("value") for o in var.get("options", [])}
-            if value not in legal:
-                continue
-            for opt in var["options"]:
-                opt["selected"] = opt.get("value") == value
+        elif opts:
+            legal = {o.get("value") for o in opts if not isinstance(o.get("value"), list)}
+            if not all(v in legal for v in picked):
+                continue                   # the option list changed under it
+            for opt in opts:
+                opt["selected"] = opt.get("value") in picked
+        # no declared options (a query variable fills them at runtime): carry as is
         if value == var.get("current", {}).get("value"):
             continue
         var["current"] = dict(was["current"])
-        if var.get("type") != "textbox":
-            var["current"]["text"] = next(o["text"] for o in var["options"]
-                                          if o.get("value") == value)
+        if var.get("type") != "textbox" and opts:
+            texts = [o["text"] for o in opts if o.get("value") in picked]
+            var["current"]["text"] = texts if isinstance(value, list) else texts[0]
         kept.append(f"{var['name']}={value}")
     return kept
 

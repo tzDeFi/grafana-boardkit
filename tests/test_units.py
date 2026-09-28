@@ -257,3 +257,33 @@ def test_carry_over_keeps_a_viewers_choice_but_not_an_illegal_one():
     new = tabbed()
     assert carry_over_variables(_G(live), new, only={"loss"}) == ["loss=55"]
     assert carry_over_variables(_G(None), tabbed()) == []
+
+
+def test_carry_over_multi_select_and_query_variables():
+    """A multi-select holds a LIST (Grafana's "$__all" too), and a query variable
+    declares no options (Grafana fills them at runtime). Neither may crash or be
+    dropped: 2026-09-28, the EcoLiq boards' chain/venue pickers."""
+    board = tabbed()
+    board["templating"]["list"] = [
+        {"type": "custom", "name": "venues", "multi": True, "query": "a,b,c",
+         "current": {"text": ["a"], "value": ["a"]},
+         "options": [{"text": t, "value": t, "selected": t == "a"} for t in "abc"]},
+        {"type": "query", "name": "chain", "multi": True, "query": "select 1",
+         "current": {"text": "All", "value": "$__all"}, "options": []}]
+    live = tabbed()
+    live["templating"]["list"] = [
+        {"type": "custom", "name": "venues", "current": {"text": ["b", "c"], "value": ["b", "c"]}},
+        {"type": "query", "name": "chain", "current": {"text": ["etherlink"],
+                                                       "value": ["etherlink"]}}]
+    kept = carry_over_variables(_G(live), board)
+    assert kept == ["venues=['b', 'c']", "chain=['etherlink']"]
+    v, c = board["templating"]["list"]
+    assert v["current"] == {"text": ["b", "c"], "value": ["b", "c"]}
+    assert [o["selected"] for o in v["options"]] == [False, True, True]
+    assert c["current"]["value"] == ["etherlink"]
+    # a pick that is no longer an option falls back to the generated default
+    live["templating"]["list"][0]["current"] = {"text": ["z"], "value": ["z"]}
+    fresh = tabbed()
+    fresh["templating"]["list"] = [dict(board["templating"]["list"][0],
+                                        current={"text": ["a"], "value": ["a"]})]
+    assert carry_over_variables(_G(live), fresh) == []
