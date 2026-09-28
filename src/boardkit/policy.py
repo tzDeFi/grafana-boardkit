@@ -10,10 +10,10 @@ board for anyone else on the team host. Sensitivity picks the rules:
 
 One risk no permission can close on Grafana OSS: any org member can POST
 /api/ds/query with hand-written SQL to any datasource in the org. For a
-sensitive project whose datasource other people's accounts can reach, that is
-reported as a warning with the head count; the fix is a separate Grafana org
-(datasources are per org) or a database role that only sees that audience's
-rows.
+sensitive project, every apply counts, per org, the accounts that can query
+the data behind a board they cannot open (deploy._exposure). The fix is an org
+per audience (datasources are per org) with a database role that sees only
+that audience's rows: `org` on a folder or board in the declaration.
 """
 from __future__ import annotations
 
@@ -39,27 +39,3 @@ def host_errors(decl: Declaration, host, settings: dict) -> list[str]:
         errs.append(f"host {host.name} lets anonymous visitors in: sensitive boards cannot "
                     "live there (and anonymous viewers can query every datasource)")
     return errs
-
-
-def datasource_warnings(decl: Declaration, org_emails: set[str], viewers: set[str],
-                        logical: set[str]) -> list[str]:
-    """Who can read a sensitive project's data WITHOUT being allowed its boards.
-
-    Two groups, both real on Grafana OSS: accounts outside the project, and a
-    board's own viewers, who can query the rows behind every OTHER board on the
-    same datasource (one client reading another's book)."""
-    if decl.sensitivity != "sensitive" or not logical:
-        return []
-    out = []
-    outside = sorted(org_emails - viewers)
-    if outside:
-        out.append(f"{len(outside)} account(s) outside this project's viewers can query its "
-                   f"datasource(s) {sorted(logical)} with hand-written SQL (Grafana OSS). "
-                   "Isolate with a per-audience org or a row-restricted database role.")
-    scoped = [b for _, b in decl.boards() if b.viewers]
-    if scoped and len(list(decl.boards())) > 1:
-        out.append(f"{len(scoped)} board-only viewer group(s) share datasource(s) "
-                   f"{sorted(logical)} with the project's other boards: each can query the "
-                   "rows behind boards it cannot open. Give each audience its own org with a "
-                   "database role that sees only its rows.")
-    return out

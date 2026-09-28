@@ -3,7 +3,7 @@
 Deploy Grafana boards and decide who sees them, from one declaration per repo.
 
 ```bash
-pip install "boardkit @ git+https://github.com/tzDeFi/boardkit@v0.1.1"
+pip install "boardkit @ git+https://github.com/tzDeFi/boardkit@v0.2.0"
 boardkit plan   boards.toml      # validate; show the groups it will make
 boardkit deploy boards.toml      # ship to the audience's host and apply there
 ```
@@ -30,6 +30,35 @@ tabs    = true                    # boards with rows become real tabs
   home    = true                       # it is their home page
   preference_vars = ["loss"]           # kept even under --reset-vars
 ```
+
+### Orgs: the boundary for sensitive data
+
+Grafana OSS lets any member of an org send hand-written SQL to any of that
+org's datasources, so a board permission stops a viewer *opening* a board, not
+*reading the data behind it*. When one audience must not read another's rows,
+give each its own org and a database role that sees only its rows:
+
+```toml
+[[folders]]
+uid = "risk"
+org = "Risk"                          # the internal folder, in the project's own org
+viewers = ["ops@example.com"]
+[folders.datasources]
+"${DS_MAIN}" = "risk_all"             # created in that org from the host inventory
+
+  [[folders.boards]]
+  file = "grafana/book-a.json"
+  viewers = ["client-a@example.com"]
+  org  = "Risk · client-a"            # isolated: also published into an org of its own
+  home = true
+  [folders.boards.datasources]
+  "${DS_MAIN}" = "risk_client_a"      # a role that sees only client A's rows
+```
+
+The project owns the orgs it names (their members are exactly its viewers),
+and someone who is only a viewer of isolated boards is taken out of the main
+org. Every apply counts, per org, the accounts that could still query data
+behind a board they cannot open.
 
 What a deploy does, on the host:
 

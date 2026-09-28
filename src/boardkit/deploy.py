@@ -21,12 +21,13 @@ import tempfile
 from pathlib import Path
 
 from . import __version__
-from .access import apply_access
+from .access import apply_access, placement_viewers
 from .datasources import references, rewire
 from .decl import Declaration, from_dict, load
 from .grafana import GrafanaError
 from .hosts import Host, Inventory, load_inventory
-from .policy import datasource_warnings, host_errors, static_errors
+from .orgs import MAIN_ORG_ID, ensure_datasource, ensure_org, org_members
+from .policy import host_errors, static_errors
 from .publish import ensure_folder, publish_board
 
 LIB_DIR = Path(__file__).resolve().parent
@@ -49,22 +50,58 @@ def load_bundle(path: Path) -> Declaration:
     return from_dict(d, path)
 
 
-def _datasource_targets(g, host: Host, decl: Declaration) -> dict[str, dict]:
-    by_uid = {d["uid"]: d for d in g("/api/datasources")}
+def _datasource_targets(g, host: Host, mapping: dict[str, str], org: str | None,
+                        env: dict, log: list[str]) -> dict[str, dict]:
+    """board reference -> {"type", "uid"} in the org `g` acts in. In the main
+    org a logical name may be an existing (provisioned) uid; anywhere else it
+    must have a definition, and boardkit creates the datasource there."""
+    existing = {d["uid"]: d for d in g("/api/datasources")}
     out = {}
-    for ref, logical in decl.datasources.items():
-        uid = host.datasources.get(logical)
-        if uid is None:
-            raise SystemExit(f"host {host.name} has no datasource for logical name "
-                             f"{logical!r} (add it to [hosts.{host.name}.datasources])")
-        if uid not in by_uid:
-            raise SystemExit(f"host {host.name}: datasource uid {uid!r} does not exist")
-        out[ref] = {"type": by_uid[uid]["type"], "uid": uid}
+    for ref, logical in mapping.items():
+        uid = host.datasources.get(logical) if org is None else None
+        if uid is not None:
+            if uid not in existing:
+                raise SystemExit(f"host {host.name}: datasource uid {uid!r} does not exist")
+            out[ref] = {"type": existing[uid]["type"], "uid": uid}
+        elif logical in host.datasource_defs:
+            out[ref] = ensure_datasource(g, logical, host.datasource_defs[logical], env, log,
+                                         org or "main")
+        else:
+            raise SystemExit(f"host {host.name} has no datasource for logical name {logical!r}"
+                             f" in org {org or 'main'!r} (add [hosts.{host.name}."
+                             f"datasource_defs.{logical}])")
+    return out
+
+
+def _exposure(g, decl: Declaration, org_ids: dict) -> list[str]:
+    """Per org: accounts that can query the data behind a board they cannot
+    open (any org member can POST SQL to any datasource of the org)."""
+    if decl.sensitivity != "sensitive":
+        return []
+    boards: dict[str | None, list] = {}
+    for org, f, b, isolated, who in placement_viewers(decl):
+        refs = references(json.loads(b.file.read_text()))
+        m = decl.datasource_map(f, b, isolated)
+        boards.setdefault(org, []).append((b.uid, who, {m[r] for r in refs if r in m}))
+    out = []
+    for org, items in boards.items():
+        used = set().union(*(ds for _, _, ds in items))
+        if not used:
+            continue
+        members = {e for e, u in org_members(g, org_ids[org]).items()
+                   if u["role"] != "Admin" and u.get("login") != "admin"}
+        exposed = sorted(e for e in members
+                         if any(ds and e not in who for _, who, ds in items))
+        if exposed:
+            out.append(f"{len(exposed)} account(s) in org {org or 'main'!r} can query the data "
+                       f"behind boards they cannot open (datasources {sorted(used)}; Grafana "
+                       "OSS lets any org member send SQL). Isolate the audience: its own org "
+                       "and a row-restricted database role.")
     return out
 
 
 def apply_project(host: Host, decl: Declaration, *, access_only: bool = False,
-                  reset_vars: bool = False, g=None) -> dict:
+                  reset_vars: bool = False, g=None, others=()) -> dict:
     """On the host: publish (unless access_only) and converge access."""
     g = g or host.grafana()
     report = {"project": decl.project, "host": host.name, "published": [],
@@ -73,43 +110,48 @@ def apply_project(host: Host, decl: Declaration, *, access_only: bool = False,
     if errs:
         report["problems"] = errs
         return report                      # refuse before touching anything
+    env = host.admin_env()
+    org_ids = {None: MAIN_ORG_ID}
+    for name in sorted(decl.owned_orgs()):
+        org_ids[name] = ensure_org(g, name, report["changed"])
     if not access_only:
-        targets = _datasource_targets(g, host, decl)
-        for f in decl.folders:
-            report["changed"] += ensure_folder(g, f.uid, f.title)
-            for b in f.boards:
+        for org, f, b, isolated, _who in placement_viewers(decl):
+            go = g.in_org(org_ids[org])
+            report["changed"] += ensure_folder(go, f.uid, f.title)
+            targets = _datasource_targets(go, host, decl.datasource_map(f, b, isolated), org,
+                                          env, report["changed"])
+            try:
                 board = rewire(json.loads(b.file.read_text()), targets)
-                tabs = f.tabs if b.tabs is None else b.tabs
-                try:
-                    r = publish_board(g, board, f.uid, tabs=tabs, reset_vars=reset_vars,
-                                      preference_vars=b.preference_vars,
-                                      message=f"boardkit {__version__} ({decl.project})")
-                except GrafanaError as e:
-                    report["problems"].append(f"{b.uid}: {e}")
-                    continue
-                report["published"].append(r)
-                report["problems"] += [f"{b.uid}: {p}" for p in r["problems"]]
-    acc = apply_access(g, decl, host.root_url)
+            except ValueError as e:
+                report["problems"].append(str(e))
+                continue
+            tabs = f.tabs if b.tabs is None else b.tabs
+            try:
+                r = publish_board(go, board, f.uid, tabs=tabs, reset_vars=reset_vars,
+                                  preference_vars=b.preference_vars,
+                                  message=f"boardkit {__version__} ({decl.project})")
+            except GrafanaError as e:
+                report["problems"].append(f"{b.uid}{' in ' + org if org else ''}: {e}")
+                continue
+            r["org"] = org
+            report["published"].append(r)
+            report["problems"] += [f"{b.uid}: {p}" for p in r["problems"]]
+    acc = apply_access(g, decl, host.root_url, org_ids, others)
     for k in ("changed", "problems", "warnings"):
         report[k] += acc[k]
     report["invites"] = acc["invites"]
-    viewers = set()
-    for f in decl.folders:
-        if isinstance(f.viewers, list):
-            viewers |= set(f.viewers)
-        for b in f.boards:
-            viewers |= set(b.viewers)
-    org = {u["email"].lower() for u in g("/api/org/users") if u.get("login") != "admin"}
-    used = {decl.datasources[r] for _, b in decl.boards()
-            for r in references(json.loads(b.file.read_text())) if r in decl.datasources}
-    report["warnings"] += datasource_warnings(decl, org, viewers, used)
+    report["warnings"] += _exposure(g, decl, org_ids)
     return report
 
 
 def apply_stored(host: Host, project: str | None, **kw) -> list[dict]:
     root = host.store_path / "projects"
-    names = [project] if project else sorted(p.name for p in root.iterdir() if p.is_dir())
-    return [apply_project(host, load_bundle(root / n), **kw) for n in names]
+    all_names = sorted(p.name for p in root.iterdir() if p.is_dir() and
+                       (p / "declaration.json").is_file())
+    decls = {n: load_bundle(root / n) for n in all_names}
+    names = [project] if project else all_names
+    return [apply_project(host, decls[n], others=[d for m, d in decls.items() if m != n], **kw)
+            for n in names]
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -174,8 +216,8 @@ def deploy(decl_path, *, inventory: Inventory | None = None, access_only=False,
             if dest.exists():
                 shutil.rmtree(dest)
             shutil.copytree(b, dest)
-            return [apply_project(host, load_bundle(dest), access_only=access_only,
-                                  reset_vars=reset_vars)]
+            return apply_stored(host, decl.project, access_only=access_only,
+                                reset_vars=reset_vars)
         ship(host, b, decl.project, run=run)
     return remote_apply(host, decl.project, access_only=access_only, reset_vars=reset_vars,
                         run=run)

@@ -1,6 +1,6 @@
 [project]
 name = "boardkit"
-version = "0.1.1"
+version = "0.2.0"
 description = "Deploy Grafana boards and manage who sees them, from one declaration per repo"
 readme = "README.md"
 requires-python = ">=3.11"

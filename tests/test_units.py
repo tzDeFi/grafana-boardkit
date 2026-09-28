@@ -9,7 +9,7 @@ from boardkit import decl as D
 from boardkit.datasources import references, rewire
 from boardkit.deploy import bundle, load_bundle, remote_apply, ship
 from boardkit.hosts import Host, load_inventory, read_env_file
-from boardkit.policy import datasource_warnings, host_errors, static_errors
+from boardkit.policy import host_errors, static_errors
 from boardkit.publish import carry_over_variables
 
 from .boards import plain, tabbed
@@ -115,16 +115,70 @@ def test_sensitive_boards_refuse_an_anonymous_host(tmp_path):
     assert any("not audience 'me'" in e for e in host_errors(d, HOST, {}))
 
 
-def test_datasource_warning_counts_outsiders(tmp_path):
-    d = D.from_dict(_decl(tmp_path), tmp_path)
-    w = datasource_warnings(d, {"int@example.com", "m@example.com", "x@y.z"},
-                            {"int@example.com", "m@example.com"}, {"main"})
-    assert w and w[0].startswith("1 account(s)")
-    only_scoped = datasource_warnings(d, {"a@b.c"}, {"a@b.c"}, {"main"})
-    assert len(only_scoped) == 1 and "rows behind boards it cannot open" in only_scoped[0], \
-        "a board-only viewer can read the other boards' rows: always said"
-    d.folders[0].boards[0].viewers = []
-    assert datasource_warnings(d, {"a@b.c"}, {"a@b.c"}, {"main"}) == []
+def _iso(tmp_path, project="p"):
+    d = _decl(tmp_path)
+    d["project"] = project
+    d["folders"][0]["org"] = "P"
+    d["folders"][0]["boards"][0]["org"] = "P · a"
+    d["folders"][0]["boards"][0]["datasources"] = {"${DS_MAIN}": "main_a"}
+    return D.from_dict(d, tmp_path)
+
+
+def test_placements_and_isolated_only(tmp_path):
+    from boardkit.access import isolated_only, placement_viewers
+    d = _iso(tmp_path)
+    got = [(org, b.uid, iso, sorted(who)) for org, f, b, iso, who in placement_viewers(d)]
+    assert got == [("P", "bk-a", False, ["int@example.com"]),
+                   ("P · a", "bk-a", True, ["m@example.com"]),
+                   ("P", "bk-b", False, ["int@example.com"])]
+    assert d.datasource_map(d.folders[0], d.folders[0].boards[0], True)["${DS_MAIN}"] == "main_a"
+    assert isolated_only([d]) == {"m@example.com"}
+    # someone isolated here but a main-org viewer in another project stays in main
+    (tmp_path / "o").mkdir()
+    o = _decl(tmp_path / "o", project="q", sensitivity="open")
+    o["folders"] = [{"uid": "q1", "viewers": ["m@example.com"], "boards": [{"file": "b.json"}]}]
+    assert isolated_only([d, D.from_dict(o, tmp_path / "o")]) == set()
+
+
+def test_isolation_rules(tmp_path):
+    d = _decl(tmp_path)
+    d["folders"][0]["boards"][1]["org"] = "X"
+    with pytest.raises(D.DeclarationError, match="needs viewers"):
+        D.from_dict(d, tmp_path)
+    d = _decl(tmp_path)
+    d["folders"][0]["org"] = "Main Org."
+    with pytest.raises(D.DeclarationError, match="other than the main org"):
+        D.from_dict(d, tmp_path)
+    d = _decl(tmp_path)
+    d["folders"][0]["boards"][0]["datasources"] = {"x": "y"}
+    with pytest.raises(D.DeclarationError, match="only to an isolated board"):
+        D.from_dict(d, tmp_path)
+
+
+def test_exposure_counts_members_who_can_read_boards_they_cannot_open(tmp_path):
+    from boardkit.deploy import _exposure
+    shared = D.from_dict(_decl(tmp_path), tmp_path)      # both boards in the main org
+
+    class G:
+        """Org members by org id, from the X-Grafana-Org-Id-free admin API."""
+
+        def __init__(self, by_org):
+            self.by_org = by_org
+
+        def __call__(self, path, method="GET", body=None, ok404=False):
+            oid = int(path.split("/")[3])
+            return [{"email": e, "role": "Viewer", "login": e, "userId": i}
+                    for i, e in enumerate(self.by_org.get(oid, []))]
+
+    w = _exposure(G({1: ["int@example.com", "m@example.com"]}), shared, {None: 1})
+    assert len(w) == 1 and w[0].startswith("1 account(s) in org 'main'"), w  # m reads bk-b
+    iso = _iso(tmp_path)
+    ids = {"P": 2, "P · a": 3}
+    assert _exposure(G({2: ["int@example.com"], 3: ["m@example.com"]}), iso, ids) == [], \
+        "isolated: nobody can query rows behind a board they cannot open"
+    leaked = _exposure(G({2: ["int@example.com", "m@example.com"], 3: ["m@example.com"]}),
+                       iso, ids)
+    assert len(leaked) == 1 and "org 'P'" in leaked[0], "m left in the folder's org is caught"
 
 
 # ── hosts ────────────────────────────────────────────────────────────────────

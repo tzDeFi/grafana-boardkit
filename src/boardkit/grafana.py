@@ -54,6 +54,16 @@ class Grafana:
         except urllib.error.URLError as e:
             raise GrafanaError(method, path, 0, f"cannot reach {self.url}: {e.reason}") from None
 
+    def in_org(self, org_id: int | None) -> Grafana:
+        """The same client, acting in another org (X-Grafana-Org-Id). The
+        account must be a member of it; boardkit's admin is, as its creator."""
+        g = object.__new__(Grafana)
+        g.url, g.timeout, g.headers = self.url, self.timeout, dict(self.headers)
+        g.headers.pop("X-Grafana-Org-Id", None)
+        if org_id is not None:
+            g.headers["X-Grafana-Org-Id"] = str(org_id)
+        return g
+
     # ── small helpers everything uses ──────────────────────────────────────
 
     def settings(self) -> dict:

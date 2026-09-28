@@ -24,6 +24,7 @@ command converges the host on the declaration.
 | Where credentials live | Only on the host: the bundle is shipped and applied there | Admin passwords never travel or sit in CI |
 | Accounts for people without one | Viewer invite link returned by the deploy (no SMTP on the hosts); an access-only apply on a timer seats them once they register | Grafana OSS cannot attach a team to an invite |
 | Dependencies | Python stdlib only | Runs on a host with nothing but `python3`; the deploy ships the library with the bundle, so host and repo never disagree on the version |
+| Keeping one audience out of another's data | A Grafana org per audience, each with a database role restricted by row-level security; the project owns its orgs | Datasources are per org, and any org member can query them with hand-written SQL: no permission inside an org can stop that |
 | Real tabs | Classic JSON is what repos generate and test; the v2 `TabsLayout` is produced at publish time and pinned to Grafana's own conversion by a live test | Tabs exist only in the v2 schema |
 
 ## Tools considered (compare-and-select, 2026-09-28)

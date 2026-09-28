@@ -49,5 +49,15 @@ def audit(g: Grafana) -> dict:
         flags.append(f"anonymous role is {out['anonymous_role']}")
     if out["sign_up"]:
         flags.append("self sign-up is on")
+    orgs = {}
+    for o in g("/api/orgs"):
+        go = g.in_org(o["id"])
+        members = g(f"/api/orgs/{o['id']}/users")
+        orgs[f"{o['name']} ({o['id']})"] = {
+            "members": sorted(f"{u.get('email') or u.get('login')}:{u['role']}" for u in members),
+            "datasources": sorted(d["uid"] for d in go("/api/datasources")),
+            "boards": sorted(d["uid"] for d in go("/api/search?type=dash-db&limit=5000")),
+        }
+    out["orgs"] = orgs
     out["flags"] = flags
     return out

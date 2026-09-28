@@ -233,3 +233,106 @@ def test_converter_matches_grafanas_own_conversion(grafana_container, datasource
                                                "layout": r["spec"]["layout"]}}
             for r in spec["layout"]["spec"]["rows"]]}}
     _same(to_v2(board)["spec"], spec)
+
+
+def _query(g: Grafana, ds_uid: str, sql: str, org_id: int | None = None):
+    go = g.in_org(org_id) if org_id else g
+    r = go("/api/ds/query", "POST", {"queries": [{"refId": "A", "datasource": {"uid": ds_uid},
+                                                  "rawSql": sql, "format": "table"}],
+                                     "from": "now-1h", "to": "now"})
+    frame = r["results"]["A"]["frames"][0]
+    return sorted(frame["data"]["values"][0])
+
+
+def test_isolated_org_journey(tmp_path, tmp_inventory, grafana_container, monkeypatch):
+    """A sensitive project whose client may open only their board, and must not
+    read the rows behind any other: the board is ALSO published into an org of
+    the client's own, through a database role that sees only their rows.
+
+    deploy -> the internal viewer is invited into the project's org, the client
+    into theirs -> both register -> a client who already had an account in the
+    main org is moved out of it -> the client lands in their org, their board
+    is the home page, their datasource returns ONLY their rows, and they are in
+    no other org; the internal viewer reads everything in the project's org."""
+    c = grafana_container
+    admin = _admin(c)
+    monkeypatch.setenv("E2E_PG_ALL", c["pg_passwords"]["ro_all"])
+    monkeypatch.setenv("E2E_PG_A", c["pg_passwords"]["ro_a"])
+    inv_path = tmp_path / "hosts.toml"
+    inv_path.write_text(tmp_inventory.read_text() + f'''
+[hosts.local.datasource_defs.rho_all]
+type = "grafana-postgresql-datasource"
+url = "{c['pg_host']}"
+database = "book"
+user = "ro_all"
+password_var = "E2E_PG_ALL"
+sslmode = "disable"
+[hosts.local.datasource_defs.rho_a]
+type = "grafana-postgresql-datasource"
+url = "{c['pg_host']}"
+database = "book"
+user = "ro_a"
+password_var = "E2E_PG_A"
+sslmode = "disable"
+''')
+    inv = load_inventory(inv_path)
+    # someone who already has an account in the MAIN org (as a manager who
+    # registered before isolation existed)
+    admin("/api/admin/users", "POST", {"name": "early", "email": "early@example.com",
+                                       "login": "early@example.com",
+                                       "password": "Correct-horse-9"})
+    decl = _write(tmp_path, {
+        "project": "rho", "audience": "internal", "sensitivity": "sensitive",
+        "datasources": {"${DS_MAIN}": "rho_all"},
+        "folders": [{"uid": "rho", "title": "Rho", "org": "Rho",
+                     "viewers": ["ops@example.com"],
+                     "boards": [
+                         {"file": "r1.json", "viewers": ["cli@example.com", "early@example.com"],
+                          "org": "Rho · a", "home": True,
+                          "datasources": {"${DS_MAIN}": "rho_a"}},
+                         {"file": "r2.json"}]}]},
+        {"r1.json": plain("rho-r1", "Client A", "${DS_MAIN}"),
+         "r2.json": plain("rho-r2", "Internal", "${DS_MAIN}")})
+
+    [r] = deploy(decl, inventory=inv)
+    assert r["problems"] == [], r
+    assert sorted((p["uid"], p["org"]) for p in r["published"]) == \
+        [("rho-r1", "Rho"), ("rho-r1", "Rho · a"), ("rho-r2", "Rho")]
+    assert set(r["invites"]) == {"ops@example.com", "cli@example.com"}
+    assert "removed early@example.com from the main org (their boards are isolated; " \
+           "there they could query its datasources)" in r["changed"], r["changed"]
+    for email in ("ops@example.com", "cli@example.com"):
+        _register(c, r["invites"][email], email)
+    [r2] = deploy(decl, inventory=inv, access_only=True)
+    assert r2["problems"] == [] and r2["invites"] == {}
+    assert r2["warnings"] == [], "isolated: nobody can read rows behind a board they cannot open"
+
+    orgs = {o["name"]: o["id"] for o in admin("/api/orgs")}
+    for email in ("cli@example.com", "early@example.com"):
+        u = _as(c, email)
+        assert u("/api/user")["orgId"] == orgs["Rho · a"], f"{email} lands in their own org"
+        assert {o["name"] for o in u("/api/user/orgs")} == {"Rho · a"}, "and in no other"
+        assert u("/api/dashboards/home")["redirectUri"].startswith("/d/rho-r1/")
+        assert _status(u, "/api/dashboards/uid/rho-r1") == 200
+        assert _status(u, "/api/dashboards/uid/rho-r2") == 404, "not in their org at all"
+        assert _query(u, "bk-rho-a", "select account from book") == ["a", "a"], \
+            "their datasource returns only their rows"
+        # an org they are not in: Grafana either refuses the header or serves
+        # their own org instead. Either way, nothing of that org reaches them:
+        for other in (orgs["Rho"], 1):
+            go = u.in_org(other)
+            try:
+                seen = {d["uid"] for d in go("/api/search?type=dash-db")}
+            except GrafanaError as e:
+                assert e.status in (401, 403), e
+                seen = set()
+            assert seen <= {"rho-r1"}, f"{email} sees {seen} via org {other}"
+            with pytest.raises(GrafanaError) as denied:
+                _query(u, "bk-rho-all", "select account from book", other)
+            assert denied.value.status in (400, 401, 403, 404), denied.value
+        with pytest.raises(GrafanaError):
+            _query(u, "bk-rho-all", "select account from book")   # not in their org
+    ops = _as(c, "ops@example.com")
+    assert _query(ops, "bk-rho-all", "select account from book", orgs["Rho"]) == ["a", "a", "b"]
+    assert {d["uid"] for d in ops.in_org(orgs["Rho"])("/api/search?type=dash-db")} == \
+        {"rho-r1", "rho-r2"}

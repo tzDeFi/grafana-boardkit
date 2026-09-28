@@ -21,6 +21,23 @@
       home    = true                # the board is those viewers' home page
       preference_vars = ["loss"]    # carried over even under --reset-vars
 
+Orgs (a sensitive project's real boundary: Grafana OSS lets any org member
+query any of that org's datasources, so only an org keeps a viewer out of
+data they may not see):
+
+    [[folders]]
+    org = "Risk"                    # the folder lives in its own org; its
+    [folders.datasources]           # datasources are created there from the
+    "${DS_MAIN}" = "risk_all"       # host inventory's [datasource_defs]
+      [[folders.boards]]
+      viewers = ["m@y.com"]
+      org     = "Risk · client-a"   # ISOLATED: also published into this org,
+      [folders.boards.datasources]  # where its viewers are the only members,
+      "${DS_MAIN}" = "risk_client_a" # through a datasource that sees their rows
+
+A project owns every org it names: members are exactly the declared viewers.
+Someone who is a viewer only inside such orgs is taken out of the main org.
+
 TOML or JSON. Unknown keys are rejected: a typo must not silently drop a
 restriction. Paths are relative to the declaration file.
 """
@@ -35,6 +52,7 @@ from pathlib import Path
 AUDIENCES = ("me", "internal")
 SENSITIVITIES = ("sensitive", "open")
 ALL = "all"
+MAIN_ORG_NAMES = ("Main Org.", "Main Org")
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -53,6 +71,8 @@ class Board:
     home: bool = False
     preference_vars: list[str] = field(default_factory=list)
     tabs: bool | None = None
+    org: str | None = None                      # isolated into its own org
+    datasources: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -63,6 +83,8 @@ class Folder:
     team: str | None = None
     tabs: bool = False
     boards: list[Board] = field(default_factory=list)
+    org: str | None = None                      # None = the main org
+    datasources: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -93,16 +115,26 @@ class Declaration:
             for b in f.boards:
                 yield f, b
 
+    def datasource_map(self, f: Folder, b: Board | None = None, isolated: bool = False) -> dict:
+        m = {**self.datasources, **f.datasources}
+        if isolated and b is not None:
+            m.update(b.datasources)
+        return m
+
+    def owned_orgs(self) -> set[str]:
+        return {f.org for f in self.folders if f.org} | {b.org for _, b in self.boards() if b.org}
+
     def to_dict(self, board_path=lambda b: str(b.file)) -> dict:
         return {
             "project": self.project, "audience": self.audience,
             "sensitivity": self.sensitivity, "datasources": dict(self.datasources),
             "folders": [{
                 "uid": f.uid, "title": f.title, "viewers": f.viewers, "team": f.team,
-                "tabs": f.tabs,
+                "tabs": f.tabs, "org": f.org, "datasources": dict(f.datasources),
                 "boards": [{"file": board_path(b), "viewers": b.viewers, "team": b.team,
                             "home": b.home, "preference_vars": b.preference_vars,
-                            "tabs": b.tabs} for b in f.boards]}
+                            "tabs": b.tabs, "org": b.org, "datasources": dict(b.datasources)}
+                           for b in f.boards]}
                 for f in self.folders]}
 
 
@@ -128,6 +160,21 @@ def _emails(v, where: str, allow_all: bool) -> list[str] | str:
     return sorted(out)
 
 
+def _org(v, where: str) -> str | None:
+    if v is None:
+        return None
+    if not isinstance(v, str) or not v.strip() or v.strip() in MAIN_ORG_NAMES:
+        raise DeclarationError(f"{where}: org must be a name other than the main org")
+    return v.strip()
+
+
+def _dsmap(d: dict, where: str) -> dict[str, str]:
+    m = d.get("datasources", {})
+    if not isinstance(m, dict) or not all(isinstance(v, str) for v in m.values()):
+        raise DeclarationError(f"{where}: datasources maps board references to logical names")
+    return dict(m)
+
+
 def from_dict(d: dict, root: Path) -> Declaration:
     _keys(d, {"project", "audience", "sensitivity", "datasources", "folders"}, "declaration")
     project = d.get("project", "")
@@ -143,15 +190,18 @@ def from_dict(d: dict, root: Path) -> Declaration:
     folders, uids = [], set()
     for i, fd in enumerate(d.get("folders", [])):
         where = f"folders[{i}]"
-        _keys(fd, {"uid", "title", "viewers", "team", "tabs", "boards"}, where)
+        _keys(fd, {"uid", "title", "viewers", "team", "tabs", "boards", "org", "datasources"},
+              where)
         if not _SLUG.match(fd.get("uid", "")):
             raise DeclarationError(f"{where}: uid must be a slug (<= 40 chars)")
         f = Folder(uid=fd["uid"], title=fd.get("title") or fd["uid"],
                    viewers=_emails(fd.get("viewers", []), where, allow_all=True),
-                   team=fd.get("team"), tabs=bool(fd.get("tabs", False)))
+                   team=fd.get("team"), tabs=bool(fd.get("tabs", False)),
+                   org=_org(fd.get("org"), where), datasources=_dsmap(fd, where))
         for j, bd in enumerate(fd.get("boards", [])):
             bwhere = f"{where}.boards[{j}]"
-            _keys(bd, {"file", "viewers", "team", "home", "preference_vars", "tabs"}, bwhere)
+            _keys(bd, {"file", "viewers", "team", "home", "preference_vars", "tabs", "org",
+                       "datasources"}, bwhere)
             path = (root / bd["file"]).resolve()
             if not path.is_file():
                 raise DeclarationError(f"{bwhere}: no board file {bd['file']}")
@@ -166,9 +216,17 @@ def from_dict(d: dict, root: Path) -> Declaration:
                       viewers=_emails(bd.get("viewers", []), bwhere, allow_all=False),
                       team=bd.get("team"), home=bool(bd.get("home", False)),
                       preference_vars=list(bd.get("preference_vars", [])),
-                      tabs=bd.get("tabs"))
+                      tabs=bd.get("tabs"), org=_org(bd.get("org"), bwhere),
+                      datasources=_dsmap(bd, bwhere))
             if b.home and not b.viewers:
                 raise DeclarationError(f"{bwhere}: home = true needs board viewers")
+            if b.org and not b.viewers:
+                raise DeclarationError(f"{bwhere}: an isolated board (org) needs viewers")
+            if b.org and b.org == f.org:
+                raise DeclarationError(f"{bwhere}: org {b.org!r} is the folder's own org")
+            if b.datasources and not b.org:
+                raise DeclarationError(f"{bwhere}: board datasources apply only to an "
+                                       "isolated board (set org)")
             f.boards.append(b)
         folders.append(f)
     if not folders:

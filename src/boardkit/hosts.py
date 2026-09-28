@@ -16,8 +16,18 @@ their admin credentials live), at $BOARDKIT_HOSTS or
     admin_password_var = "GRAFANA_ADMIN_PASSWORD"
     store       = "~/.local/share/boardkit"       # bundles land here
 
-    [hosts.teamhost.datasources]     # logical name -> this host's uid
+    [hosts.teamhost.datasources]     # logical name -> an existing uid (main org)
     main = "pg-main"
+
+    [hosts.teamhost.datasource_defs.risk_client_a]   # created by boardkit, in any
+    type     = "grafana-postgresql-datasource"        # org that needs it
+    url      = "db.example:5432"
+    database = "risk"
+    user     = "risk_client_a_ro"
+    password_var = "RISK_CLIENT_A_PG_PASSWORD"        # read from env_file on the host
+    sslmode  = "require"
+
+`env_file` may be a list of files (e.g. the deploy .env and a secrets file).
 
 The admin credentials are read on the host, when it applies a bundle; they
 never travel.
@@ -40,11 +50,12 @@ class Host:
     ssh: str
     grafana_url: str
     root_url: str
-    env_file: str | None = None
+    env_file: str | list[str] | None = None
     admin_user_var: str = "GF_SECURITY_ADMIN_USER"
     admin_password_var: str = "GF_SECURITY_ADMIN_PASSWORD"
     store: str = "~/.local/share/boardkit"
     datasources: dict[str, str] = field(default_factory=dict)
+    datasource_defs: dict[str, dict] = field(default_factory=dict)
 
     @property
     def store_path(self) -> Path:
@@ -52,8 +63,9 @@ class Host:
 
     def admin_env(self) -> dict[str, str]:
         env = dict(os.environ)
-        if self.env_file:
-            env.update(read_env_file(Path(os.path.expanduser(self.env_file))))
+        files = [self.env_file] if isinstance(self.env_file, str) else (self.env_file or [])
+        for f in files:
+            env.update(read_env_file(Path(os.path.expanduser(f))))
         return env
 
     def grafana(self) -> Grafana:
