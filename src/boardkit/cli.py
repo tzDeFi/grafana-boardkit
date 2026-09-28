@@ -17,7 +17,9 @@ def _print(reports: list[dict], as_json: bool) -> int:
         print(f"== {r['project']} on {r['host']}")
         for p in r["published"]:
             note = f"  (kept {', '.join(p['kept'])})" if p["kept"] else ""
-            print(f"  published {p['uid']}: {'OK' if not p['problems'] else 'MISMATCH'}{note}")
+            where = f" in {p['org']!r}" if p.get("org") else ""
+            print(f"  published {p['uid']}{where}: "
+                  f"{'OK' if not p['problems'] else 'MISMATCH'}{note}")
         for c in r["changed"]:
             print(f"  changed  {c}")
         for e, link in sorted(r["invites"].items()):
@@ -78,10 +80,16 @@ def main(argv=None) -> None:
         for f in decl.folders:
             who = "every account" if f.viewers == "all" else \
                 f"team {decl.folder_team(f)!r} = {f.viewers}"
-            print(f"  folder {f.title} ({f.uid}): {who}")
+            print(f"  folder {f.title} ({f.uid}) in org {f.org or 'main'!r}: {who}")
             for b in f.boards:
-                extra = (f"; + team {decl.board_team(b)!r} = {b.viewers}"
-                         f"{' (home)' if b.home else ''}") if b.viewers else ""
+                home = " (home)" if b.home else ""
+                if b.org:
+                    extra = (f"; isolated in org {b.org!r} = {b.viewers}{home}, "
+                             f"datasources {decl.datasource_map(f, b, True)}")
+                elif b.viewers:
+                    extra = f"; + team {decl.board_team(b)!r} = {b.viewers}{home}"
+                else:
+                    extra = ""
                 print(f"    board {b.uid}{extra}")
         errs = static_errors(decl)
         for e in errs:
