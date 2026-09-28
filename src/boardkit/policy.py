@@ -17,6 +17,8 @@ that audience's rows: `org` on a folder or board in the declaration.
 """
 from __future__ import annotations
 
+import re
+
 from .decl import ALL, Declaration
 
 
@@ -38,4 +40,25 @@ def host_errors(decl: Declaration, host, settings: dict) -> list[str]:
     if decl.sensitivity == "sensitive" and anon:
         errs.append(f"host {host.name} lets anonymous visitors in: sensitive boards cannot "
                     "live there (and anonymous viewers can query every datasource)")
+    return errs
+
+
+_SCRIPTY = re.compile(r"<\s*script|\bon[a-z]+\s*=|javascript:", re.I)
+
+
+def board_errors(board: dict) -> list[str]:
+    """Refuse text panels that carry script. A host may run with
+    GF_PANELS_DISABLE_SANITIZE_HTML=true (an iframe embed needs it), and then a
+    text panel's HTML runs in every viewer's session, an admin's included."""
+    errs = []
+
+    def walk(panels):
+        for p in panels:
+            if p.get("type") == "text":
+                content = (p.get("options") or {}).get("content") or p.get("content") or ""
+                if _SCRIPTY.search(content):
+                    errs.append(f"text panel {p.get('id')} {p.get('title')!r} carries script "
+                                "(<script>, an on*= handler or javascript:): refused")
+            walk(p.get("panels", []))
+    walk(board.get("panels", []))
     return errs

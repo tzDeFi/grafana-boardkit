@@ -224,9 +224,10 @@ def test_ship_and_remote_apply_commands(tmp_path):
 
     h = Host(name="tm", serves=["internal"], ssh="tm", grafana_url="u", root_url="r")
     ship(h, tmp_path, "risk", run=run)
-    assert calls[1][:3] == ["rsync", "-a", "--delete"]
-    assert calls[1][-1] == "tm:.local/share/boardkit/tmp/risk/", "home-relative, no ~"
-    assert "mv tmp/risk projects/risk" in calls[3][2]
+    assert "lib/boardkit/__init__.py" in calls[0][2], "reads the host's library version first"
+    assert calls[2][:3] == ["rsync", "-a", "--delete"]
+    assert calls[2][-1] == "tm:.local/share/boardkit/tmp/risk/", "home-relative, no ~"
+    assert "mv tmp/risk projects/risk" in calls[4][2]
     remote_apply(h, "risk", access_only=True, reset_vars=False, run=run)
     assert calls[-1][:2] == ["ssh", "tm"]
     assert "PYTHONPATH=$HOME/.local/share/boardkit/lib python3 -m boardkit apply " \
@@ -287,3 +288,41 @@ def test_carry_over_multi_select_and_query_variables():
     fresh["templating"]["list"] = [dict(board["templating"]["list"][0],
                                         current={"text": ["a"], "value": ["a"]})]
     assert carry_over_variables(_G(live), fresh) == []
+
+
+def test_ship_refuses_to_downgrade_the_hosts_library(tmp_path, monkeypatch):
+    """The host keeps ONE library for every stored project and its timer: a
+    repo pinned to an older boardkit must not roll everyone back."""
+    class R:
+        stdout = '__version__ = "99.0.0"\n'
+
+    h = Host(name="tm", serves=["internal"], ssh="tm", grafana_url="u", root_url="r")
+    monkeypatch.delenv("BOARDKIT_ALLOW_DOWNGRADE", raising=False)
+    with pytest.raises(SystemExit, match="newer than this"):
+        ship(h, tmp_path, "risk", run=lambda cmd: R())
+
+
+def test_text_panels_with_script_are_refused():
+    from boardkit.policy import board_errors
+    ok = plain()
+    ok["panels"].append({"id": 9, "type": "text", "title": "embed", "options": {
+        "mode": "html", "content": '<iframe src="http://h:8320/" style="border:0"></iframe>'}})
+    assert board_errors(ok) == []
+    for bad in ("<script>alert(1)</script>", '<img src=x onerror="steal()">',
+                '<a href="javascript:steal()">x</a>'):
+        b = plain()
+        b["panels"].append({"id": 9, "type": "text", "title": "t",
+                            "options": {"mode": "html", "content": bad}})
+        assert board_errors(b), bad
+
+
+def test_identities_pin_and_persist_privately(tmp_path):
+    import os
+
+    from boardkit.identities import Identities
+    p = tmp_path / "identities.json"
+    ids = Identities(p)
+    ids.pin("a@example.com", 7)
+    assert Identities(p).get("a@example.com") == 7
+    assert oct(os.stat(p).st_mode & 0o777) == "0o600"
+    assert ids.unpin("a@example.com") and Identities(p).get("a@example.com") is None

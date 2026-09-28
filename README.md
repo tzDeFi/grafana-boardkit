@@ -3,7 +3,7 @@
 Deploy Grafana boards and decide who sees them, from one declaration per repo.
 
 ```bash
-pip install "boardkit @ git+https://github.com/tzDeFi/boardkit@v0.2.2"
+pip install "boardkit @ git+https://github.com/tzDeFi/boardkit@v0.3.0"
 boardkit plan   boards.toml      # validate; show the groups it will make
 boardkit deploy boards.toml      # ship to the audience's host and apply there
 ```
@@ -71,8 +71,14 @@ What a deploy does, on the host:
 3. **Converges access**: one team per group, members exactly the declared
    emails, View on the folder or the board, the board as the team's home page;
    every other grant on the project's folders and boards removed (Admin-level
-   grants stay). Addresses without an account get a Viewer invite link, which
-   the deploy prints for you to send.
+   grants stay). People are accounts **pinned by id**, never names: a declared address with
+   no account gets one created at once (login = email = the address) and a
+   one-time password in the report, for you to hand over (these hosts have no
+   SMTP). An address already held by an account boardkit did not create is
+   not seated until you vouch for it with `boardkit adopt EMAIL` on the host;
+   a pinned account whose login or email has changed is unseated and
+   reported. (Grafana lets any signed-in user rename their own login and
+   email, so a name is never proof of who someone is.)
 
 The host re-applies every stored project on a timer (`boardkit apply --all
 --access-only`) so that people who register are seated without a redeploy.

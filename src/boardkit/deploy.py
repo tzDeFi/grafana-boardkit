@@ -13,11 +13,15 @@ need nothing from the repo. Admin credentials stay on the host.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import re
 import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from . import __version__
@@ -26,8 +30,9 @@ from .datasources import references, rewire
 from .decl import Declaration, from_dict, load
 from .grafana import GrafanaError
 from .hosts import Host, Inventory, load_inventory
+from .identities import Identities
 from .orgs import MAIN_ORG_ID, ensure_datasource, ensure_org, org_members
-from .policy import host_errors, static_errors
+from .policy import board_errors, host_errors, static_errors
 from .publish import ensure_folder, publish_board
 
 LIB_DIR = Path(__file__).resolve().parent
@@ -105,7 +110,7 @@ def apply_project(host: Host, decl: Declaration, *, access_only: bool = False,
     """On the host: publish (unless access_only) and converge access."""
     g = g or host.grafana()
     report = {"project": decl.project, "host": host.name, "published": [],
-              "changed": [], "invites": {}, "problems": [], "warnings": []}
+              "changed": [], "new_accounts": {}, "problems": [], "warnings": []}
     errs = static_errors(decl) + host_errors(decl, host, g.settings())
     if errs:
         report["problems"] = errs
@@ -120,8 +125,13 @@ def apply_project(host: Host, decl: Declaration, *, access_only: bool = False,
             report["changed"] += ensure_folder(go, f.uid, f.title)
             targets = _datasource_targets(go, host, decl.datasource_map(f, b, isolated), org,
                                           env, report["changed"])
+            raw = json.loads(b.file.read_text())
+            bad = board_errors(raw)
+            if bad:
+                report["problems"] += [f"{b.uid}: {e}" for e in bad]
+                continue
             try:
-                board = rewire(json.loads(b.file.read_text()), targets)
+                board = rewire(raw, targets)
             except ValueError as e:
                 report["problems"].append(str(e))
                 continue
@@ -136,22 +146,64 @@ def apply_project(host: Host, decl: Declaration, *, access_only: bool = False,
             r["org"] = org
             report["published"].append(r)
             report["problems"] += [f"{b.uid}: {p}" for p in r["problems"]]
-    acc = apply_access(g, decl, host.root_url, org_ids, others)
+    acc = apply_access(g, decl, host.root_url, org_ids, others,
+                       identities=Identities(host.store_path / "identities.json"))
     for k in ("changed", "problems", "warnings"):
         report[k] += acc[k]
-    report["invites"] = acc["invites"]
+    report["new_accounts"] = acc["new_accounts"]
     report["warnings"] += _exposure(g, decl, org_ids)
     return report
 
 
+class _HostLock:
+    """One apply at a time on a host: the timer and a deploy's apply both take
+    it, so they never race to create the same team or seat."""
+
+    def __init__(self, path: Path, wait_s: float = 180):
+        self.path, self.wait_s, self.f = path, wait_s, None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(self.path, "w")
+        t0 = time.time()
+        while True:
+            try:
+                fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.time() - t0 > self.wait_s:
+                    raise SystemExit(f"another boardkit apply holds {self.path}") from None
+                time.sleep(1)
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
 def apply_stored(host: Host, project: str | None, **kw) -> list[dict]:
+    """Apply stored bundles, each on its own: one project's failure is a
+    problem in its report, never a reason to stop converging the others."""
     root = host.store_path / "projects"
-    all_names = sorted(p.name for p in root.iterdir() if p.is_dir() and
-                       (p / "declaration.json").is_file())
-    decls = {n: load_bundle(root / n) for n in all_names}
-    names = [project] if project else all_names
-    return [apply_project(host, decls[n], others=[d for m, d in decls.items() if m != n], **kw)
-            for n in names]
+    with _HostLock(host.store_path / "apply.lock"):
+        all_names = sorted(p.name for p in root.iterdir() if p.is_dir() and
+                           (p / "declaration.json").is_file())
+        decls, reports = {}, []
+        for n in all_names:
+            try:
+                decls[n] = load_bundle(root / n)
+            except Exception as e:  # noqa: BLE001
+                reports.append({"project": n, "host": host.name, "published": [], "changed": [],
+                                "new_accounts": {}, "warnings": [],
+                                "problems": [f"stored bundle unreadable: {e}"]})
+        for n in ([project] if project else sorted(decls)):
+            try:
+                reports.append(apply_project(host, decls[n], others=[d for m, d in decls.items()
+                                                                     if m != n], **kw))
+            except Exception as e:  # noqa: BLE001  (a crash here must not stall the rest)
+                reports.append({"project": n, "host": host.name, "published": [],
+                                "changed": [], "new_accounts": {}, "warnings": [],
+                                "problems": [f"apply failed: {type(e).__name__}: {e}"]})
+        return reports
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -164,10 +216,24 @@ def _rsync_path(store: str) -> str:
     return store.removeprefix("~/")
 
 
+def _version(text: str) -> tuple[int, ...]:
+    m = re.search(r'__version__ = "([0-9.]+)"', text)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else (0,)
+
+
 def ship(host: Host, bundle_dir: Path, project: str, run=_run) -> None:
     """rsync the bundle and the library onto the host, atomically enough:
-    each lands in a temp dir that is swapped in with one mv."""
+    each lands in a temp dir that is swapped in with one mv. The host keeps ONE
+    library for every stored project and the timer, so an older one never
+    replaces a newer one (set BOARDKIT_ALLOW_DOWNGRADE=1 to force)."""
     store = host.store.replace("~", "$HOME", 1)
+    have = run(["ssh", host.ssh,
+                f"cat {store}/lib/boardkit/__init__.py 2>/dev/null || true"]).stdout
+    mine = (LIB_DIR / "__init__.py").read_text()
+    if _version(have) > _version(mine) and os.environ.get("BOARDKIT_ALLOW_DOWNGRADE") != "1":
+        raise SystemExit(f"host {host.name} runs boardkit {'.'.join(map(str, _version(have)))}, "
+                         f"newer than this {'.'.join(map(str, _version(mine)))}: upgrade the "
+                         "repo's pin rather than downgrading every project on the host")
     rs = _rsync_path(host.store)
     remote = (f"set -e; mkdir -p {store}/projects {store}/tmp; "
               f"rm -rf {store}/tmp/{project} {store}/tmp/lib; mkdir -p {store}/tmp/lib")

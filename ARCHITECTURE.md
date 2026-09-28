@@ -22,7 +22,7 @@ command converges the host on the declaration.
 | What sensitivity changes | `sensitive`: login-only host, explicit viewers, no builtin-role grants; `open`: may grant every account | The two classes the boards actually fall into |
 | How it reaches a host | Publish **directly** to the host's Grafana; no cloud stack, no mirror sync | One user system per host instead of three; no sync layer to lag or lose tabs |
 | Where credentials live | Only on the host: the bundle is shipped and applied there | Admin passwords never travel or sit in CI |
-| Accounts for people without one | Viewer invite link returned by the deploy (no SMTP on the hosts); an access-only apply on a timer seats them once they register | Grafana OSS cannot attach a team to an invite |
+| Accounts for people without one | boardkit CREATES the account (login = email = the declared address), pins it by id and prints a one-time password to hand over; accounts it did not create are seated only after `boardkit adopt` | Grafana lets any signed-in user rename their own login and email, and an invitee picks their own username: resolving people by name let a viewer take an unregistered person's seat (review, 2026-09-28, reproduced). Invites leave the address free until the person registers; a created account never does |
 | Dependencies | Python stdlib only | Runs on a host with nothing but `python3`; the deploy ships the library with the bundle, so host and repo never disagree on the version |
 | Keeping one audience out of another's data | A Grafana org per audience, each with a database role restricted by row-level security; the project owns its orgs | Datasources are per org, and any org member can query them with hand-written SQL: no permission inside an org can stop that |
 | Real tabs | Classic JSON is what repos generate and test; the v2 `TabsLayout` is produced at publish time and pinned to Grafana's own conversion by a live test | Tabs exist only in the v2 schema |
@@ -42,6 +42,10 @@ Pick: a small stdlib library, because the valuable part is the model
 tests against a real Grafana, not the HTTP calls.
 
 ## Grafana behaviours the tests pin (13.0.2)
+
+* Any signed-in user can change their own login AND email (PUT /api/user) to
+  any unused value, with no verification: a name is never an identity.
+  Completing an invite with a different email is refused (400).
 
 * A GF_* variable under the wrong section is accepted and ignored: read
   `/api/admin/settings`, never the compose file (`boardkit audit`).

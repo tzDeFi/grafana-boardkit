@@ -8,8 +8,11 @@ import sys
 from . import __version__
 
 
-def _print(reports: list[dict], as_json: bool) -> int:
+def _print(reports: list[dict], as_json: bool, redact: bool = False) -> int:
     bad = any(r["problems"] for r in reports)
+    if redact:                  # a log on disk must never hold a password
+        for r in reports:
+            r["new_accounts"] = {e: "<redacted>" for e in r.get("new_accounts", {})}
     if as_json:
         print(json.dumps(reports, indent=1, ensure_ascii=False))
         return 1 if bad else 0
@@ -22,8 +25,8 @@ def _print(reports: list[dict], as_json: bool) -> int:
                   f"{'OK' if not p['problems'] else 'MISMATCH'}{note}")
         for c in r["changed"]:
             print(f"  changed  {c}")
-        for e, link in sorted(r["invites"].items()):
-            print(f"  invite   {e}: {link}")
+        for e, pw in sorted(r.get("new_accounts", {}).items()):
+            print(f"  ACCOUNT  {e}  password {pw}   (shown once: hand it over, they change it)")
         for w in r["warnings"]:
             print(f"  WARNING  {w}")
         for p in r["problems"]:
@@ -52,6 +55,16 @@ def main(argv=None) -> None:
     a.add_argument("--access-only", action="store_true")
     a.add_argument("--reset-vars", action="store_true")
     a.add_argument("--json", action="store_true")
+    a.add_argument("--redact", action="store_true", help="never print new passwords (timers)")
+
+    ad = sub.add_parser("adopt", help="(on the host) vouch that an existing account is this "
+                                      "declared person, and pin it")
+    ad.add_argument("emails", nargs="*")
+    ad.add_argument("--declared", action="store_true",
+                    help="every declared viewer of the stored projects whose account has "
+                         "login == email == the declared address")
+    un = sub.add_parser("unpin", help="(on the host) forget an address's pinned account")
+    un.add_argument("emails", nargs="+")
 
     p = sub.add_parser("plan", help="validate a declaration and show the groups it makes")
     p.add_argument("declaration")
@@ -71,7 +84,46 @@ def main(argv=None) -> None:
         host = inv.hosts[inv.self_name]
         sys.exit(_print(apply_stored(host, None if args.all else args.project,
                                      access_only=args.access_only,
-                                     reset_vars=args.reset_vars), args.json))
+                                     reset_vars=args.reset_vars), args.json, args.redact))
+    if args.cmd in ("adopt", "unpin"):
+        from .grafana import q
+        from .hosts import load_inventory
+        from .identities import Identities
+        inv = load_inventory()
+        host = inv.hosts[inv.self_name]
+        ids = Identities(host.store_path / "identities.json")
+        if args.cmd == "unpin":
+            for e in args.emails:
+                print(f"{e}: {'unpinned' if ids.unpin(e.lower()) else 'was not pinned'}")
+            return
+        emails = [e.lower() for e in args.emails]
+        if args.declared:
+            from .access import placement_viewers
+            from .deploy import load_bundle
+            root = host.store_path / "projects"
+            for d in sorted(p for p in root.iterdir() if (p / "declaration.json").is_file()):
+                for _o, _f, _b, _i, who in placement_viewers(load_bundle(d)):
+                    emails += sorted(who)
+        g = host.grafana()
+        bad = 0
+        for e in dict.fromkeys(emails):
+            if ids.get(e) is not None:
+                continue
+            hits = [x for x in g(f"/api/users/search?perpage=100&query={q(e)}")["users"]
+                    if (x.get("login") or "").lower() == e or (x.get("email") or "").lower() == e]
+            exact = [x for x in hits if (x.get("login") or "").lower() == e
+                     and (x.get("email") or "").lower() == e]
+            if len(hits) == 1 and exact:
+                ids.pin(e, exact[0]["id"])
+                print(f"{e}: pinned account #{exact[0]['id']}")
+            elif not hits:
+                print(f"{e}: no account (the next apply creates one)")
+            else:
+                bad += 1
+                print(f"{e}: NOT pinned, ambiguous or mismatched: "
+                      + "; ".join(f"#{x['id']} login {x.get('login')!r} email {x.get('email')!r}"
+                                  for x in hits))
+        sys.exit(1 if bad else 0)
     if args.cmd == "plan":
         from .decl import load
         from .policy import static_errors

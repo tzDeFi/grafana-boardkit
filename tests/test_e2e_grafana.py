@@ -2,8 +2,8 @@
 
   a sensitive project declares a folder (internal viewer) with two boards,
   each with its own viewer -> deploy: folder + boards (one with real tabs),
-  datasources rewired, invites issued -> the invitees REGISTER through
-  Grafana's own invite flow -> the host's access-only apply seats them ->
+  datasources rewired, an ACCOUNT created, pinned and seated for each viewer
+  (a one-time password to hand over) -> the timer's apply changes nothing ->
   each logs in and can open exactly what was declared, home page included ->
   anonymous gets nothing -> an open project next to it is visible to every
   account but grants nothing on the sensitive folder -> removing a viewer
@@ -34,8 +34,17 @@ def _admin(c):
     return Grafana(c["url"], user="admin", password=c["password"])
 
 
-def _as(c, email, pw="Correct-horse-9"):
-    return Grafana(c["url"], user=email, password=pw)
+#: one-time passwords boardkit printed for the accounts it created, by email
+PW: dict[str, str] = {}
+
+
+def _as(c, email, pw=None):
+    return Grafana(c["url"], user=email, password=pw or PW.get(email, "Correct-horse-9"))
+
+
+def _keep(report) -> dict:
+    PW.update(report.get("new_accounts", {}))
+    return report
 
 
 def _status(g: Grafana, path: str) -> int:
@@ -93,17 +102,6 @@ SENSITIVE = {
             {"file": "b.json", "viewers": ["bob@example.com"], "tabs": False}]}]}
 
 
-def _register(c, link: str, email: str):
-    code = link.rsplit("/", 1)[1]
-    body = json.dumps({"inviteCode": code, "email": email, "username": email,
-                       "name": email.split("@")[0], "password": "Correct-horse-9",
-                       "confirmPassword": "Correct-horse-9"}).encode()
-    req = urllib.request.Request(c["url"] + "/api/user/invite/complete", data=body,
-                                 method="POST", headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        assert r.status == 200
-
-
 def test_journey_sensitive_and_open_projects(tmp_path, tmp_inventory, grafana_container,
                                              datasource):
     c = grafana_container
@@ -111,11 +109,13 @@ def test_journey_sensitive_and_open_projects(tmp_path, tmp_inventory, grafana_co
     admin = _admin(c)
     decl = _write(tmp_path, SENSITIVE, {"a.json": tabbed("bk-a"), "b.json": plain("bk-b")})
 
-    # 1. first deploy: boards up, invites out, nobody seated yet
+    # 1. first deploy: boards up, and every declared person gets an ACCOUNT at
+    #    once (login = email), seated at once, with a one-time password to hand over
     [r] = deploy(decl, inventory=inv)
+    _keep(r)
     assert r["problems"] == [], r
     assert {p["uid"] for p in r["published"]} == {"bk-a", "bk-b"}
-    assert set(r["invites"]) == {"int@example.com", "alice@example.com", "bob@example.com"}
+    assert set(r["new_accounts"]) == {"int@example.com", "alice@example.com", "bob@example.com"}
     ns = admin.namespace()
     a = admin(f"/apis/dashboard.grafana.app/v2/namespaces/{ns}/dashboards/bk-a")
     assert a["spec"]["layout"]["kind"] == "TabsLayout"
@@ -125,14 +125,9 @@ def test_journey_sensitive_and_open_projects(tmp_path, tmp_inventory, grafana_co
     assert b["panels"][0]["datasource"] == {"type": "grafana-postgresql-datasource",
                                             "uid": "pg-main"}, "rewired to the host's uid"
 
-    # 2. they register through Grafana's own invite flow
-    for email, link in r["invites"].items():
-        _register(c, link, email)
-
-    # 3. the host's timer (access-only apply) seats them
+    # 2. the timer's access-only apply changes nothing and prints no password
     [r2] = deploy(decl, inventory=inv, access_only=True)
-    assert r2["problems"] == [] and r2["invites"] == {}
-    assert sum("added" in x for x in r2["changed"]) == 3
+    assert r2["problems"] == [] and r2["new_accounts"] == {} and r2["changed"] == []
 
     # 4. each sees exactly what was declared
     alice, bob, internal = (_as(c, e) for e in
@@ -177,8 +172,10 @@ def test_journey_sensitive_and_open_projects(tmp_path, tmp_inventory, grafana_co
     SENS2["folders"][0]["boards"][1]["viewers"] = ["dan@example.com"]
     decl2 = _write(tmp_path, SENS2, {})
     [r4] = deploy(decl2, inventory=inv, access_only=True)
-    assert "removed bob@example.com from 'alpha · bk-b'" in r4["changed"], r4["changed"]
-    assert set(r4["invites"]) == {"dan@example.com"}
+    _keep(r4)
+    assert any(x.startswith("removed bob@example.com") and "'alpha · bk-b'" in x
+               for x in r4["changed"]), r4["changed"]
+    assert set(r4["new_accounts"]) == {"dan@example.com"}
     _eventually(bob, "/api/dashboards/uid/bk-b", 403, "removal reaches the removed viewer")
     assert _status(alice, "/api/dashboards/uid/bk-a") == 200, "nobody else affected"
 
@@ -295,21 +292,28 @@ sslmode = "disable"
          "r2.json": plain("rho-r2", "Internal", "${DS_MAIN}")})
 
     [r] = deploy(decl, inventory=inv)
-    assert r["problems"] == [], r
+    _keep(r)
     assert sorted((p["uid"], p["org"]) for p in r["published"]) == \
         [("rho-r1", "Rho"), ("rho-r1", "Rho · a"), ("rho-r2", "Rho")]
-    assert set(r["invites"]) == {"ops@example.com", "cli@example.com"}
-    assert "removed early@example.com from the main org (their boards are isolated; " \
-           "there they could query its datasources)" in r["changed"], r["changed"]
-    for email in ("ops@example.com", "cli@example.com"):
-        _register(c, r["invites"][email], email)
+    assert set(r["new_accounts"]) == {"ops@example.com", "cli@example.com"}
+    # an account boardkit did not create is never trusted on its own
+    assert [p for p in r["problems"] if p.startswith("early@example.com: already held")], r
+    assert len(r["problems"]) == 1, r["problems"]
+    monkeypatch.setenv("BOARDKIT_HOSTS", str(inv_path))
+    from boardkit.cli import main as cli
+    with pytest.raises(SystemExit) as done:
+        cli(["adopt", "early@example.com"])
+    assert done.value.code == 0
     [r2] = deploy(decl, inventory=inv, access_only=True)
-    assert r2["problems"] == [] and r2["invites"] == {}
-    assert r2["warnings"] == [], "isolated: nobody can read rows behind a board they cannot open"
+    assert r2["problems"] == [], r2["problems"]
+    assert "removed early@example.com from the main org (their boards are isolated; " \
+           "there they could query its datasources)" in r2["changed"], r2["changed"]
+    [r3] = deploy(decl, inventory=inv, access_only=True)
+    assert r3["warnings"] == [], "isolated: nobody can read rows behind a board they cannot open"
 
     orgs = {o["name"]: o["id"] for o in admin("/api/orgs")}
     for email in ("cli@example.com", "early@example.com"):
-        u = _as(c, email)
+        u = _as(c, email)            # early keeps the password it was created with
         assert u("/api/user")["orgId"] == orgs["Rho · a"], f"{email} lands in their own org"
         assert {o["name"] for o in u("/api/user/orgs")} == {"Rho · a"}, "and in no other"
         assert u("/api/dashboards/home")["redirectUri"].startswith("/d/rho-r1/")
