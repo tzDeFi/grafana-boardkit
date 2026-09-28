@@ -1,0 +1,12 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv && uv pip install -e . pytest ruff
+      - run: .venv/bin/ruff check src tests
+      # includes the end-to-end journey on a real Grafana OSS (docker is on the runner)
+      - run: .venv/bin/python -m pytest -q

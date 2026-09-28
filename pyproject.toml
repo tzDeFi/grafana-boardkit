@@ -1,0 +1,31 @@
+[project]
+name = "boardkit"
+version = "0.1.0"
+description = "Deploy Grafana boards and manage who sees them, from one declaration per repo"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []          # stdlib only: it runs on hosts with no venv
+
+[project.scripts]
+boardkit = "boardkit.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["e2e: drives a real Grafana OSS container (needs docker)"]
+
+[tool.ruff]
+line-length = 100
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/boardkit"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
