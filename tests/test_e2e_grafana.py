@@ -340,3 +340,15 @@ sslmode = "disable"
     assert _query(ops, "bk-rho-all", "select account from book", orgs["Rho"]) == ["a", "a", "b"]
     assert {d["uid"] for d in ops.in_org(orgs["Rho"])("/api/search?type=dash-db")} == \
         {"rho-r1", "rho-r2"}
+
+    # the audit's main-org views describe the main org whichever org the admin
+    # last switched to (an unheaded call acts in the CURRENT org: it once read 3)
+    from boardkit.audit import audit
+    admin("/api/user/using/" + str(orgs["Rho"]), "POST")
+    try:
+        a = audit(admin)
+        assert "bk-rho-all" not in " ".join(a["datasources"]), a["datasources"]
+        assert not any("rho" in f for f in a["folders"]), a["folders"]
+        assert not any(x.startswith("ops@example.com") for x in a["accounts"]), a["accounts"]
+    finally:
+        admin("/api/user/using/1", "POST")

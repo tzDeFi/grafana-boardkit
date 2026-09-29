@@ -13,7 +13,12 @@ from .grafana import Grafana, q
 
 
 def audit(g: Grafana) -> dict:
+    """The main org's access, then each org's members, datasources and boards.
+
+    Every main-org call names org 1: an unheaded call acts in the admin's
+    CURRENT org, whichever org they last switched to."""
     s = g.settings()
+    main = g.in_org(1)
     anon = s.get("auth.anonymous", {})
     users = s.get("users", {})
     out = {
@@ -23,23 +28,23 @@ def audit(g: Grafana) -> dict:
         "invite_lifetime": users.get("user_invite_max_lifetime_duration"),
         "root_url": s.get("server", {}).get("root_url"),
     }
-    org_users = g("/api/org/users")
+    org_users = main("/api/org/users")
     out["accounts_by_role"] = dict(collections.Counter(u["role"] for u in org_users))
     out["accounts"] = sorted(f"{u.get('email') or u.get('login')}:{u['role']}"
                              for u in org_users)
-    out["pending_invites"] = sorted(i["email"] for i in g("/api/org/invites"))
+    out["pending_invites"] = sorted(i["email"] for i in main("/api/org/invites"))
     out["teams"] = {t["name"]: t.get("memberCount")
-                    for t in g("/api/teams/search?perpage=1000")["teams"]}
+                    for t in main("/api/teams/search?perpage=1000")["teams"]}
     folders = {}
-    for f in g("/api/folders?limit=1000"):
-        acl = g(f"/api/access-control/folders/{q(f['uid'])}")
+    for f in main("/api/folders?limit=1000"):
+        acl = main(f"/api/access-control/folders/{q(f['uid'])}")
         folders[f"{f['title']} ({f['uid']})"] = sorted(
             (f"team:{p['team']}" if p.get("teamId") else
              f"builtin:{p['builtInRole']}" if p.get("builtInRole") else
              f"user:{p.get('userLogin')}") + f"={p['permission']}"
             for p in acl if not p.get("isInherited"))
     out["folders"] = folders
-    ds = g("/api/datasources")
+    ds = main("/api/datasources")
     out["datasources"] = sorted(f"{d['name']} ({d['uid']}, {d['type']})" for d in ds)
     flags = []
     if out["anonymous"] and ds:
