@@ -29,3 +29,6 @@ packages = ["src/boardkit"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
+
+[project.urls]
+Repository = "https://github.com/tzDeFi/grafana-boardkit"

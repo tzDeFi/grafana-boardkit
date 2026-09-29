@@ -3,10 +3,14 @@
 Deploy Grafana boards and decide who sees them, from one declaration per repo.
 
 ```bash
-pip install "boardkit @ git+https://github.com/tzDeFi/boardkit@v0.3.1"
+pip install "boardkit @ git+https://github.com/tzDeFi/grafana-boardkit@v0.3.1"
 boardkit plan   boards.toml      # validate; show the groups it will make
 boardkit deploy boards.toml      # ship to the audience's host and apply there
 ```
+
+Use v0.3.0 or later. Earlier versions matched people by login or email, which
+any signed-in Grafana user can change on their own account, and they cannot
+refuse a downgrade of the library already on a host.
 
 ## The declaration (in the repo, next to its boards)
 
