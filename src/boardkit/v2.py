@@ -29,6 +29,7 @@ _HIDE = {0: "dontHide", 1: "hideLabel", 2: "hideVariable"}
 _REFRESH_INTERVALS = ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h",
                       "2h", "1d"]
 _CURSOR = {0: "Off", 1: "Crosshair", 2: "Tooltip"}
+_QUICK_RANGE_KEYS = {"display", "from", "to"}
 
 BUILTIN_ANNOTATION = {
     "kind": "AnnotationQuery",
@@ -141,6 +142,23 @@ def tabs(board: dict) -> list[tuple[str, int, list[dict]]]:
     return out
 
 
+def _quick_ranges(board: dict) -> dict:
+    """Classic `timepicker.quick_ranges` -> v2 `timeSettings.quickRanges`, the
+    mapping Grafana's own conversion makes (pinned live by tests/test_e2e_grafana.py).
+    Absent when the board sets none, or an empty list (Grafana's conversion does
+    the same). A board that sets some REPLACES Grafana's built-in list, so it must
+    carry the whole list it wants. An entry with any other key raises: Grafana
+    drops it silently."""
+    qr = (board.get("timepicker") or {}).get("quick_ranges")
+    if not qr:
+        return {}
+    if not isinstance(qr, list) or not all(
+            isinstance(q, dict) and set(q) == _QUICK_RANGE_KEYS for q in qr):
+        raise ValueError("timepicker.quick_ranges must be a list of entries with exactly the "
+                         f"keys {sorted(_QUICK_RANGE_KEYS)} (the converter maps no others): {qr!r}")
+    return {"quickRanges": [dict(q) for q in qr]}
+
+
 def to_v2(board: dict, folder_uid: str | None = None) -> dict:
     """The v2 resource for a classic board. Rows -> tabs, first tab open; a
     board with no rows at all (the aggregate) stays one plain grid."""
@@ -186,7 +204,8 @@ def to_v2(board: dict, folder_uid: str | None = None) -> dict:
                 "from": board["time"]["from"], "to": board["time"]["to"],
                 "autoRefresh": board.get("refresh", ""),
                 "autoRefreshIntervals": list(_REFRESH_INTERVALS),
-                "hideTimepicker": False, "fiscalYearStartMonth": 0},
+                "hideTimepicker": False, "fiscalYearStartMonth": 0,
+                **_quick_ranges(board)},
             "title": board["title"],
             "variables": [_variable(v)
                           for v in board.get("templating", {}).get("list", [])],

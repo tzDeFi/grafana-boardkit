@@ -3,7 +3,7 @@
 Deploy Grafana boards and decide who sees them, from one declaration per repo.
 
 ```bash
-pip install "boardkit @ git+https://github.com/tzDeFi/grafana-boardkit@v0.3.1"
+pip install "boardkit @ git+https://github.com/tzDeFi/grafana-boardkit@v0.3.2"
 boardkit plan   boards.toml      # validate; show the groups it will make
 boardkit deploy boards.toml      # ship to the audience's host and apply there
 ```
@@ -71,7 +71,9 @@ What a deploy does, on the host:
 2. **Publishes** each board: the folder by uid, datasource references rewired to
    the host's own datasources (an unmapped one is an error), rows turned into
    real tabs if asked, the values viewers chose in dropdowns carried over, and
-   the board **read back** and compared.
+   the board **read back** and compared (panels, tabs, folder, and the time
+   picker's range, timezone and quick ranges: a setting Grafana did not keep is
+   a problem in the report).
 3. **Converges access**: one team per group, members exactly the declared
    emails, View on the folder or the board, the board as the team's home page;
    every other grant on the project's folders and boards removed (Admin-level
@@ -83,6 +85,12 @@ What a deploy does, on the host:
    a pinned account whose login or email has changed is unseated and
    reported. (Grafana lets any signed-in user rename their own login and
    email, so a name is never proof of who someone is.)
+
+A board's `timepicker.quick_ranges` (a list of `{display, from, to}`) is carried
+into the real-tabs form. When a board sets it, Grafana uses that list in place
+of its built-in presets, so declare every range the board should offer; an entry
+with any other key is refused. Before v0.3.2 it was dropped silently on a tabbed
+board and the deploy read back clean.
 
 The host re-applies every stored project on a timer (`boardkit apply --all
 --access-only`) so that people who register are seated without a redeploy.

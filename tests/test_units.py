@@ -1,18 +1,21 @@
 """Fast checks of each piece; test_e2e_grafana.py drives them together."""
 from __future__ import annotations
 
+import copy
 import json
 
 import pytest
 
 from boardkit import decl as D
+from boardkit import publish
 from boardkit.datasources import references, rewire
 from boardkit.deploy import bundle, load_bundle, remote_apply, ship
 from boardkit.hosts import Host, load_inventory, read_env_file
 from boardkit.policy import host_errors, static_errors
-from boardkit.publish import carry_over_variables
+from boardkit.publish import carry_over_variables, publish_board
+from boardkit.v2 import to_v2
 
-from .boards import plain, tabbed
+from .boards import QUICK_RANGES, plain, tabbed
 
 
 def _decl(tmp_path, **over):
@@ -326,3 +329,150 @@ def test_identities_pin_and_persist_privately(tmp_path):
     assert Identities(p).get("a@example.com") == 7
     assert oct(os.stat(p).st_mode & 0o777) == "0o600"
     assert ids.unpin("a@example.com") and Identities(p).get("a@example.com") is None
+
+
+# ── v2: the time picker's quick ranges ───────────────────────────────────────
+
+def _with_quick(board, quick=QUICK_RANGES):
+    board["timepicker"] = {"quick_ranges": copy.deepcopy(quick)}
+    return board
+
+
+def test_quick_ranges_map_to_v2_in_the_declared_order():
+    got = to_v2(_with_quick(tabbed()))["spec"]["timeSettings"]["quickRanges"]
+    assert got == QUICK_RANGES
+    assert [q["display"] for q in got] == ["Yesterday", "Last 2 hours", "Last 7 days"]
+    b = _with_quick(tabbed())
+    to_v2(b)["spec"]["timeSettings"]["quickRanges"][0]["display"] = "changed"
+    assert b["timepicker"]["quick_ranges"] == QUICK_RANGES, "the output is a copy"
+
+
+@pytest.mark.parametrize("picker", [None, "absent", {}, {"quick_ranges": []},
+                                    {"quick_ranges": None}],
+                         ids=["null", "absent", "empty", "empty-list", "none"])
+def test_no_quick_ranges_leaves_the_output_as_it_was(picker):
+    """A board that sets none keeps Grafana's built-in list: no quickRanges key,
+    and the rest of timeSettings exactly what 0.3.1 sent."""
+    b = tabbed()
+    if picker != "absent":
+        b["timepicker"] = picker
+    assert to_v2(b) == to_v2(tabbed())
+    assert to_v2(b)["spec"]["timeSettings"] == {
+        "timezone": "utc", "from": "now-7d", "to": "now", "autoRefresh": "5m",
+        "autoRefreshIntervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"],
+        "hideTimepicker": False, "fiscalYearStartMonth": 0}
+
+
+def test_quick_ranges_change_nothing_else_in_the_resource():
+    without, with_ = to_v2(tabbed(), "f1"), to_v2(_with_quick(tabbed()), "f1")
+    assert with_["spec"]["timeSettings"].pop("quickRanges") == QUICK_RANGES
+    assert with_ == without
+
+
+@pytest.mark.parametrize("bad", [
+    [{"display": "x", "from": "now-1h", "to": "now", "hidden": True}],
+    [{"display": "x", "from": "now-1h"}],
+    [QUICK_RANGES[0], {"display": "x", "from": "now-1h", "to": "now", "foo": 1}],
+    {"display": "x", "from": "now-1h", "to": "now"},
+    "now-1h",
+    [["x", "now-1h", "now"]],
+], ids=["unknown-key", "missing-key", "second-entry", "not-a-list", "string", "entry-not-a-dict"])
+def test_a_quick_range_the_converter_cannot_map_raises(bad):
+    """Grafana would drop what it cannot map without a word."""
+    with pytest.raises(ValueError, match=r"timepicker\.quick_ranges"):
+        to_v2(_with_quick(tabbed(), bad))
+
+
+# ── publish: the time picker must read back as declared ──────────────────────
+
+class _Grafana:
+    """Just enough of Grafana, in memory: whatever is POSTed (classic) or POSTed
+    and PUT (v2) is read back through `mangle`, as a Grafana that drops or
+    changes a setting would. `mangle` gets the v2 `spec` or the classic board."""
+
+    def __init__(self, mangle=lambda doc: None):
+        self.v2 = self.classic = None
+        self.mangle = mangle
+
+    def namespace(self):
+        return "default"
+
+    def __call__(self, path, method="GET", body=None, ok404=False):
+        if path.startswith("/apis/"):
+            if method in ("POST", "PUT"):
+                self.v2 = copy.deepcopy(body)
+                return body
+            if self.v2 is None:
+                return None
+            got = copy.deepcopy(self.v2)
+            self.mangle(got["spec"])
+            return got
+        if method == "POST":
+            self.classic = copy.deepcopy(body["dashboard"])
+            return {}
+        if self.classic is None:
+            return None
+        doc = copy.deepcopy(self.classic)
+        self.mangle(doc)
+        return {"meta": {"folderUid": "f1"}, "dashboard": doc}
+
+
+def _problems(board, mangle=lambda doc: None, tabs=True):
+    return publish_board(_Grafana(mangle), board, "f1", tabs=tabs)["problems"]
+
+
+def _drop_quick(tabs):
+    return ((lambda spec: spec["timeSettings"].pop("quickRanges")) if tabs
+            else (lambda board: board.pop("timepicker")))
+
+
+@pytest.mark.parametrize("tabs", [True, False], ids=["v2", "classic"])
+def test_readback_passes_when_the_time_settings_come_back(tabs):
+    make = tabbed if tabs else plain
+    assert _problems(_with_quick(make()), tabs=tabs) == []
+    assert _problems(make(), tabs=tabs) == [], "a board that declares none asks for none"
+
+
+@pytest.mark.parametrize("tabs", [True, False], ids=["v2", "classic"])
+def test_readback_fails_when_quick_ranges_are_missing(tabs):
+    got = _problems(_with_quick(tabbed() if tabs else plain()), _drop_quick(tabs), tabs=tabs)
+    assert len(got) == 1 and got[0].startswith("time setting quickRanges: read back None"), got
+
+
+@pytest.mark.parametrize("tabs", [True, False], ids=["v2", "classic"])
+def test_readback_fails_when_quick_ranges_come_back_reordered(tabs):
+    reorder = ((lambda spec: spec["timeSettings"]["quickRanges"].reverse()) if tabs
+               else (lambda board: board["timepicker"]["quick_ranges"].reverse()))
+    [got] = _problems(_with_quick(tabbed() if tabs else plain()), reorder, tabs=tabs)
+    assert got.startswith("time setting quickRanges: read back [")
+
+
+def test_readback_fails_when_the_range_or_the_timezone_is_dropped_or_changed():
+    def drop_timezone(spec):
+        del spec["timeSettings"]["timezone"]
+
+    def other_to(spec):
+        spec["timeSettings"]["to"] = "now-1d"
+
+    def other_from(spec):
+        spec["timeSettings"]["from"] = "now-30d"
+
+    for mangle, key in ((drop_timezone, "timezone"), (other_to, "to"), (other_from, "from")):
+        [got] = _problems(tabbed(), mangle)
+        assert got.startswith(f"time setting {key}: read back"), got
+
+
+def test_a_converter_that_drops_quick_ranges_cannot_pass(monkeypatch):
+    """The 0.3.1 incident: the converter loses the setting, Grafana stores what it
+    was sent, and the read-back must still say so (the expectation comes from the
+    declaration, not from what the converter produced)."""
+    real = publish.to_v2
+
+    def dropping(board, folder_uid=None):
+        res = real(board, folder_uid)
+        res["spec"]["timeSettings"].pop("quickRanges", None)
+        return res
+
+    monkeypatch.setattr(publish, "to_v2", dropping)
+    [got] = _problems(_with_quick(tabbed()))
+    assert got.startswith("time setting quickRanges: read back None"), got

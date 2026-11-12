@@ -2,7 +2,8 @@
 
 Publishing is: the folder exists (by uid), the board goes up (classic, or v2
 with real tabs), the values a viewer chose in the dropdowns survive, and the
-board is read BACK and compared with what was sent. A 200 is not a deploy.
+board is read BACK and compared with what was sent (panels, tabs, folder and the
+time picker's range, timezone and quick ranges). A 200 is not a deploy.
 """
 from __future__ import annotations
 
@@ -79,6 +80,28 @@ def _flat_titles(panels: list[dict]) -> list[str]:
     return out
 
 
+def _declared_time(board: dict) -> dict:
+    """What the declaration asks of the time picker, by the names a read-back
+    uses (v2 `timeSettings`). Read from the CLASSIC board, never from to_v2's
+    output: the check must catch a converter that drops a setting, not agree
+    with it. Only what the board sets is asked for."""
+    t = board.get("time") or {}
+    want = {k: t[k] for k in ("from", "to") if k in t}
+    if "timezone" in board:
+        want["timezone"] = board["timezone"]
+    if (board.get("timepicker") or {}).get("quick_ranges"):
+        want["quickRanges"] = board["timepicker"]["quick_ranges"]
+    return want
+
+
+def _time_problems(board: dict, have: dict) -> list[str]:
+    """Every time setting the declaration sets must read back as declared (a
+    setting the converter does not carry is dropped silently, and a 200 says
+    nothing about it)."""
+    return [f"time setting {k}: read back {have.get(k)!r}, declared {v!r}"
+            for k, v in _declared_time(board).items() if have.get(k) != v]
+
+
 def _put_classic(g: Grafana, board: dict, folder_uid: str, message: str) -> list[str]:
     b = copy.deepcopy(board)
     b["id"] = None
@@ -98,7 +121,10 @@ def _put_classic(g: Grafana, board: dict, folder_uid: str, message: str) -> list
         problems.append(f"in folder {got['meta'].get('folderUid')!r}, not {folder_uid!r}")
     if _flat_titles(got["dashboard"].get("panels", [])) != _flat_titles(board.get("panels", [])):
         problems.append("panels read back differ from the panels sent")
-    return problems
+    d = got["dashboard"]
+    return problems + _time_problems(board, {
+        **(d.get("time") or {}), "timezone": d.get("timezone"),
+        "quickRanges": (d.get("timepicker") or {}).get("quick_ranges")})
 
 
 def _put_v2(g: Grafana, board: dict, folder_uid: str) -> list[str]:
@@ -132,7 +158,7 @@ def _put_v2(g: Grafana, board: dict, folder_uid: str) -> list[str]:
         n = len(board["panels"])
     if len(got["spec"]["elements"]) != n:
         problems.append(f"{len(got['spec']['elements'])} panels read back, sent {n}")
-    return problems
+    return problems + _time_problems(board, got["spec"].get("timeSettings") or {})
 
 
 def publish_board(g: Grafana, board: dict, folder_uid: str, *, tabs: bool = False,
