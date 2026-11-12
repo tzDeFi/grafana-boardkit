@@ -3,6 +3,12 @@ from __future__ import annotations
 
 import copy
 
+#: a board's whole quick-range list (when a board sets one it REPLACES Grafana's
+#: built-in presets); deliberately not in alphabetical or chronological order
+QUICK_RANGES = [{"display": "Yesterday", "from": "now-1d/d", "to": "now-1d/d"},
+                {"display": "Last 2 hours", "from": "now-2h", "to": "now"},
+                {"display": "Last 7 days", "from": "now-7d", "to": "now"}]
+
 
 def _panel(pid, title, kind, y, ds, sql, x=0, w=12, h=6):
     p = {"id": pid, "title": title, "type": kind,

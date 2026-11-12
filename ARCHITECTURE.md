@@ -55,5 +55,10 @@ tests against a real Grafana, not the HTTP calls.
   the fix is a Grafana org per audience or a row-restricted database role.
 * A new grant reaches an account that is already active after up to ~60 s
   (Grafana caches resolved permissions); a removal is immediate.
+* A classic board's `timepicker.quick_ranges` is v2 `timeSettings.quickRanges`
+  (`{display, from, to}`, in order; an empty list is stored as none; any other
+  key on an entry is dropped). The v2 PUT answers 200 whether or not the
+  converter carried it, so a deploy compares the time range, timezone and quick
+  ranges on read-back (`publish._time_problems`).
 * Org role None cannot query datasources (every panel "Access denied"), so
   viewers are org Viewers.

@@ -20,12 +20,13 @@ import urllib.request
 
 import pytest
 
+from boardkit import publish
 from boardkit.deploy import deploy
 from boardkit.grafana import Grafana, GrafanaError
 from boardkit.hosts import load_inventory
 from boardkit.v2 import to_v2
 
-from .boards import plain, tabbed
+from .boards import QUICK_RANGES, plain, tabbed
 
 pytestmark = pytest.mark.e2e
 
@@ -209,13 +210,23 @@ def _same(a, b, path=""):
         assert a == b, f"{path}: {a!r} vs {b!r}"
 
 
-@pytest.mark.parametrize("make", [tabbed, plain], ids=["rows", "no-rows"])
-def test_converter_matches_grafanas_own_conversion(grafana_container, datasource, make):
+@pytest.mark.parametrize("make, picker, uid", [
+    (tabbed, None, "conv-tabbed"), (plain, None, "conv-plain"),
+    (tabbed, {"quick_ranges": QUICK_RANGES}, "conv-tabbed-qr"),
+    (plain, {"quick_ranges": QUICK_RANGES}, "conv-plain-qr"),
+    (plain, {"quick_ranges": []}, "conv-plain-qr-empty")],
+    ids=["rows", "no-rows", "rows+quick-ranges", "no-rows+quick-ranges",
+         "no-rows+empty-quick-ranges"])
+def test_converter_matches_grafanas_own_conversion(grafana_container, datasource, make, picker,
+                                                   uid):
     """Store the classic board through the legacy API, read Grafana's v2
     rendering of it, and require to_v2 to produce the same spec (with rows
-    swapped for tabs, the one intended difference)."""
+    swapped for tabs, the one intended difference). With quick ranges: Grafana
+    carries them as timeSettings.quickRanges, in order, and an empty list as none."""
     admin = _admin(grafana_container)
-    board = make(uid=f"conv-{make.__name__}", ds_ref="pg-main")
+    board = make(uid=uid, ds_ref="pg-main")
+    if picker:
+        board["timepicker"] = picker
     for p in board["panels"]:
         for o in [p, *p.get("targets", [])]:
             if "datasource" in o:
@@ -230,6 +241,53 @@ def test_converter_matches_grafanas_own_conversion(grafana_container, datasource
                                                "layout": r["spec"]["layout"]}}
             for r in spec["layout"]["spec"]["rows"]]}}
     _same(to_v2(board)["spec"], spec)
+    assert spec["timeSettings"].get("quickRanges") == ((picker or {}).get("quick_ranges") or None)
+
+
+QUICK = {"project": "qr", "audience": "internal", "sensitivity": "sensitive",
+         "datasources": {"${DS_MAIN}": "main", "maindb": "main"},
+         "folders": [{"uid": "bk-qr", "title": "Quick ranges", "tabs": True, "boards": [
+             {"file": "t.json"}, {"file": "c.json", "tabs": False}]}]}
+
+
+def test_deploy_carries_quick_ranges_and_reports_a_dropped_one(
+        tmp_path, tmp_inventory, grafana_container, datasource, monkeypatch):
+    """0.3.1 dropped `timepicker.quick_ranges` on the way to v2 and the deploy
+    read back clean. Now the quick ranges, the range and the timezone of a board
+    come back from Grafana as declared, on both publish paths; and a converter
+    that loses one is a problem in the deploy's report."""
+    admin, inv = _admin(grafana_container), load_inventory(tmp_inventory)
+    tabbed_board, classic_board = tabbed("bk-qr-t"), plain("bk-qr-c", "Classic", "${DS_MAIN}")
+    tabbed_board["timezone"], classic_board["timezone"] = "Europe/Paris", "utc"
+    classic_board["time"] = {"from": "now-90d", "to": "now-1d"}
+    for b in (tabbed_board, classic_board):
+        b["timepicker"] = {"quick_ranges": QUICK_RANGES}
+    decl = _write(tmp_path, QUICK, {"t.json": tabbed_board, "c.json": classic_board})
+
+    [r] = deploy(decl, inventory=inv)
+    assert r["problems"] == [], r["problems"]
+    ns = admin.namespace()
+    v2 = admin(f"/apis/dashboard.grafana.app/v2/namespaces/{ns}/dashboards/bk-qr-t")
+    assert v2["spec"]["layout"]["kind"] == "TabsLayout"
+    assert v2["spec"]["timeSettings"]["quickRanges"] == QUICK_RANGES
+    assert v2["spec"]["timeSettings"]["timezone"] == "Europe/Paris"
+    classic = admin("/api/dashboards/uid/bk-qr-c")["dashboard"]
+    assert classic["timepicker"]["quick_ranges"] == QUICK_RANGES
+    assert (classic["time"], classic["timezone"]) == ({"from": "now-90d", "to": "now-1d"}, "utc")
+
+    # a converter that drops the setting is reported, not shipped silently
+    real = publish.to_v2
+
+    def dropping(board, folder_uid=None):
+        res = real(board, folder_uid)
+        res["spec"]["timeSettings"].pop("quickRanges", None)
+        return res
+
+    monkeypatch.setattr(publish, "to_v2", dropping)
+    [r2] = deploy(decl, inventory=inv)
+    assert [p for p in r2["problems"]
+            if p.startswith("bk-qr-t: time setting quickRanges: read back None")], r2["problems"]
+    assert not [p for p in r2["problems"] if "bk-qr-c" in p], "the classic board is unaffected"
 
 
 def _query(g: Grafana, ds_uid: str, sql: str, org_id: int | None = None):
