@@ -1,28 +1,25 @@
 """The whole journey on a real Grafana OSS 13.0.2 (docker), as a repo lives it.
 
-  a sensitive project declares a folder (internal viewer) with two boards,
-  each with its own viewer -> deploy: folder + boards (one with real tabs),
-  datasources rewired, an ACCOUNT created, pinned and seated for each viewer
-  (a one-time password to hand over) -> the timer's apply changes nothing ->
-  each logs in and can open exactly what was declared, home page included ->
-  anonymous gets nothing -> an open project next to it is visible to every
-  account but grants nothing on the sensitive folder -> removing a viewer
-  from the declaration takes the access away.
+  a project declares boards (no people) -> deploy: folder + boards (one with
+  real tabs), datasources rewired, NO account, team or permission created ->
+  the operator sets access in Grafana's own admin pages (users, a team, folder
+  and board grants, a home page, an invite) -> deploying again, and the host's
+  re-apply, leave every bit of it as the operator left it -> what the operator
+  removes stays removed.
 
 And the converter is pinned to Grafana's own classic -> v2 conversion, live.
 """
 from __future__ import annotations
 
+import base64
 import json
-import time
-import urllib.error
 import urllib.request
 
 import pytest
 
 from boardkit import publish
-from boardkit.deploy import deploy
-from boardkit.grafana import Grafana, GrafanaError
+from boardkit.deploy import apply_stored, deploy
+from boardkit.grafana import AccessIsGrafanas, Grafana, GrafanaError
 from boardkit.hosts import load_inventory
 from boardkit.v2 import to_v2
 
@@ -30,22 +27,15 @@ from .boards import QUICK_RANGES, plain, tabbed
 
 pytestmark = pytest.mark.e2e
 
+PASSWORD = "Correct-horse-9"
+
 
 def _admin(c):
     return Grafana(c["url"], user="admin", password=c["password"])
 
 
-#: one-time passwords boardkit printed for the accounts it created, by email
-PW: dict[str, str] = {}
-
-
-def _as(c, email, pw=None):
-    return Grafana(c["url"], user=email, password=pw or PW.get(email, "Correct-horse-9"))
-
-
-def _keep(report) -> dict:
-    PW.update(report.get("new_accounts", {}))
-    return report
+def _as(c, email):
+    return Grafana(c["url"], user=email, password=PASSWORD)
 
 
 def _status(g: Grafana, path: str) -> int:
@@ -56,21 +46,37 @@ def _status(g: Grafana, path: str) -> int:
         return e.status
 
 
-#: Grafana caches a user's resolved permissions (~60 s): a grant or a removal
-#: reaches an account that already made requests within that window. Measured
-#: waits are recorded so a slower Grafana shows up in the test output.
-WAITS: dict[str, float] = {}
+def _ui(c, path: str, method: str = "GET", body=None, org: int | None = None):
+    """What the operator's browser does in Grafana's own admin pages. boardkit's
+    client refuses access writes by design, so the test speaks plain HTTP."""
+    headers = {"Content-Type": "application/json", "Authorization": "Basic " + base64.b64encode(
+        f"admin:{c['password']}".encode()).decode()}
+    if org:
+        headers["X-Grafana-Org-Id"] = str(org)
+    req = urllib.request.Request(c["url"] + path, method=method, headers=headers,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        raw = r.read()
+        return json.loads(raw) if raw else {}
 
 
-def _eventually(g: Grafana, path: str, want: int, label: str, timeout: float = 90) -> None:
-    t0 = time.time()
-    while True:
-        got = _status(g, path)
-        if got == want:
-            WAITS[label] = round(time.time() - t0, 1)
-            return
-        assert time.time() - t0 < timeout, f"{label}: still {got} after {timeout}s"
-        time.sleep(2)
+def _access_state(c) -> dict:
+    """Everything that decides who sees what in the main org, as Grafana holds it."""
+    def acl(kind, uid):
+        return sorted(f"{p.get('userLogin') or p.get('team') or p.get('builtInRole')}"
+                      f"={p['permission']}" for p in _ui(c, f"/api/access-control/{kind}/{uid}")
+                      if not p.get("isInherited"))
+    teams = _ui(c, "/api/teams/search?perpage=1000")["teams"]
+    return {
+        "users": sorted(f"{u['login']}:{u['role']}" for u in _ui(c, "/api/orgs/1/users")),
+        "teams": {t["name"]: sorted(m["login"] for m in _ui(c, f"/api/teams/{t['id']}/members"))
+                  for t in teams},
+        "team_home": {t["name"]: _ui(c, f"/api/teams/{t['id']}/preferences").get(
+            "homeDashboardUID") for t in teams},
+        "folder": acl("folders", "bk-alpha"),
+        "board": acl("dashboards", "bk-b"),
+        "invites": sorted(i["email"] for i in _ui(c, "/api/org/invites")),
+    }
 
 
 @pytest.fixture(scope="module")
@@ -92,31 +98,28 @@ def _write(tmp_path, decl: dict, boards: dict[str, dict]):
     return p
 
 
-SENSITIVE = {
+ALPHA = {
     "project": "alpha", "audience": "internal", "sensitivity": "sensitive",
     "datasources": {"${DS_MAIN}": "main", "maindb": "main"},
     "folders": [{
-        "uid": "bk-alpha", "title": "Alpha", "viewers": ["int@example.com"], "tabs": True,
-        "boards": [
-            {"file": "a.json", "viewers": ["alice@example.com"], "home": True,
-             "preference_vars": ["loss"]},
-            {"file": "b.json", "viewers": ["bob@example.com"], "tabs": False}]}]}
+        "uid": "bk-alpha", "title": "Alpha", "tabs": True,
+        "boards": [{"file": "a.json", "preference_vars": ["loss"]},
+                   {"file": "b.json", "tabs": False}]}]}
 
 
-def test_journey_sensitive_and_open_projects(tmp_path, tmp_inventory, grafana_container,
-                                             datasource):
+def test_journey_access_is_grafanas(tmp_path, tmp_inventory, grafana_container, datasource):
     c = grafana_container
     inv = load_inventory(tmp_inventory)
     admin = _admin(c)
-    decl = _write(tmp_path, SENSITIVE, {"a.json": tabbed("bk-a"), "b.json": plain("bk-b")})
+    decl = _write(tmp_path, ALPHA, {"a.json": tabbed("bk-a"), "b.json": plain("bk-b")})
+    people_before = sorted(f"{u['login']}:{u['role']}" for u in _ui(c, "/api/orgs/1/users"))
 
-    # 1. first deploy: boards up, and every declared person gets an ACCOUNT at
-    #    once (login = email), seated at once, with a one-time password to hand over
+    # 1. deploy publishes the boards and creates no one: no account, no team,
+    #    no grant, no invite
     [r] = deploy(decl, inventory=inv)
-    _keep(r)
     assert r["problems"] == [], r
     assert {p["uid"] for p in r["published"]} == {"bk-a", "bk-b"}
-    assert set(r["new_accounts"]) == {"int@example.com", "alice@example.com", "bob@example.com"}
+    assert "new_accounts" not in r
     ns = admin.namespace()
     a = admin(f"/apis/dashboard.grafana.app/v2/namespaces/{ns}/dashboards/bk-a")
     assert a["spec"]["layout"]["kind"] == "TabsLayout"
@@ -125,70 +128,62 @@ def test_journey_sensitive_and_open_projects(tmp_path, tmp_inventory, grafana_co
     b = admin("/api/dashboards/uid/bk-b")["dashboard"]
     assert b["panels"][0]["datasource"] == {"type": "grafana-postgresql-datasource",
                                             "uid": "pg-main"}, "rewired to the host's uid"
+    st = _access_state(c)
+    assert st["users"] == people_before and not [t for t in st["teams"] if "alpha" in t.lower()]
+    assert st["invites"] == []
 
-    # 2. the timer's access-only apply changes nothing and prints no password
-    [r2] = deploy(decl, inventory=inv, access_only=True)
-    assert r2["problems"] == [] and r2["new_accounts"] == {} and r2["changed"] == []
+    # 2. the operator sets access in Grafana's own pages
+    ids = {e: _ui(c, "/api/admin/users", "POST", {
+        "name": e, "email": f"{e}@example.com", "login": f"{e}@example.com",
+        "password": PASSWORD})["id"] for e in ("alice", "bob", "carol")}
+    team = _ui(c, "/api/teams", "POST", {"name": "Alpha readers"})["teamId"]
+    _ui(c, f"/api/teams/{team}/members", "POST", {"userId": ids["alice"]})
+    _ui(c, "/api/access-control/folders/bk-alpha/builtInRoles/Viewer", "POST",
+        {"permission": ""})                      # the folder is for its team only
+    _ui(c, "/api/access-control/folders/bk-alpha/builtInRoles/Editor", "POST",
+        {"permission": ""})
+    _ui(c, f"/api/access-control/folders/bk-alpha/teams/{team}", "POST", {"permission": "View"})
+    _ui(c, f"/api/access-control/dashboards/bk-b/users/{ids['bob']}", "POST",
+        {"permission": "View"})                  # bob: one board, by name
+    _ui(c, f"/api/teams/{team}/preferences", "PUT", {"homeDashboardUID": "bk-a"})
+    _ui(c, "/api/org/invites", "POST", {"loginOrEmail": "newcomer@example.com", "name": "N",
+                                        "role": "Viewer", "sendEmail": False})
+    state = _access_state(c)
+    alice, bob, carol = (_as(c, f"{n}@example.com") for n in ("alice", "bob", "carol"))
 
-    # 4. each sees exactly what was declared
-    alice, bob, internal = (_as(c, e) for e in
-                            ("alice@example.com", "bob@example.com", "int@example.com"))
-    assert (_status(alice, "/api/dashboards/uid/bk-a"),
-            _status(alice, "/api/dashboards/uid/bk-b")) == (200, 403)
-    assert (_status(bob, "/api/dashboards/uid/bk-a"),
-            _status(bob, "/api/dashboards/uid/bk-b")) == (403, 200)
-    assert (_status(internal, "/api/dashboards/uid/bk-a"),
-            _status(internal, "/api/dashboards/uid/bk-b")) == (200, 200)
-    assert {d["uid"] for d in alice("/api/search?type=dash-db")} == {"bk-a"}
-    home = alice("/api/dashboards/home")
-    assert home.get("redirectUri", "").startswith("/d/bk-a/"), home
-    with pytest.raises(urllib.error.HTTPError) as anon:
-        urllib.request.urlopen(c["url"] + "/api/search", timeout=5)
-    assert anon.value.code == 401
+    def sees():
+        return {n: (_status(g, "/api/dashboards/uid/bk-a"), _status(g, "/api/dashboards/uid/bk-b"))
+                for n, g in (("alice", alice), ("bob", bob), ("carol", carol))}
 
-    # 5. an open project on the same host: every account sees it, and it grants
-    #    nothing on the sensitive folder
-    (tmp_path / "open").mkdir()
-    open_decl = _write(tmp_path / "open",
-                       {"project": "beta", "audience": "internal", "sensitivity": "open",
-                        "datasources": {"${DS_MAIN}": "main"},
-                        "folders": [{"uid": "bk-open", "title": "Open", "viewers": "all",
-                                     "boards": [{"file": "o.json"}]}]},
-                       {"o.json": plain("bk-o", "Open board", "${DS_MAIN}")})
-    [ro] = deploy(open_decl, inventory=inv)
-    assert ro["problems"] == []
-    admin("/api/admin/users", "POST", {"name": "carol", "email": "carol@example.com",
-                                       "login": "carol@example.com",
-                                       "password": "Correct-horse-9"})
-    carol = _as(c, "carol@example.com")
-    assert {d["uid"] for d in carol("/api/search?type=dash-db")} == {"bk-o"}
-    _eventually(alice, "/api/dashboards/uid/bk-o", 200, "grant reaches a cached account")
+    want = {"alice": (200, 200), "bob": (403, 200), "carol": (403, 403)}
+    assert sees() == want, "the operator's grants work"
+    assert alice("/api/dashboards/home").get("redirectUri", "").startswith("/d/bk-a/")
 
-    # 6. republishing is idempotent (v2 PUT on the live resourceVersion)
-    [r3] = deploy(decl, inventory=inv)
-    assert r3["problems"] == [] and not [x for x in r3["changed"] if "team" in x]
+    # 3. deploying again, and the host's re-apply, change none of it
+    for _ in range(2):
+        [again] = deploy(decl, inventory=inv)
+        assert again["problems"] == [] and again["changed"] == [], again
+    [stored] = apply_stored(inv.hosts["local"], "alpha")
+    assert stored["problems"] == [] and stored["changed"] == [], stored
+    assert _access_state(c) == state, "access is exactly as the operator left it"
+    assert sees() == want
 
-    # 7. bob leaves the board's group (dan replaces him): bob loses the board
-    SENS2 = json.loads(json.dumps(SENSITIVE))
-    SENS2["folders"][0]["boards"][1]["viewers"] = ["dan@example.com"]
-    decl2 = _write(tmp_path, SENS2, {})
-    [r4] = deploy(decl2, inventory=inv, access_only=True)
-    _keep(r4)
-    assert any(x.startswith("removed bob@example.com") and "'alpha · bk-b'" in x
-               for x in r4["changed"]), r4["changed"]
-    assert set(r4["new_accounts"]) == {"dan@example.com"}
-    _eventually(bob, "/api/dashboards/uid/bk-b", 403, "removal reaches the removed viewer")
-    assert _status(alice, "/api/dashboards/uid/bk-a") == 200, "nobody else affected"
+    # 4. what the operator removes stays removed
+    _ui(c, f"/api/teams/{team}/members/{ids['alice']}", "DELETE")
+    _ui(c, f"/api/access-control/dashboards/bk-b/users/{ids['bob']}", "POST", {"permission": ""})
+    _ui(c, f"/api/orgs/1/users/{ids['carol']}", "DELETE")
+    code = next(i["code"] for i in _ui(c, "/api/org/invites")
+                if i["email"] == "newcomer@example.com")
+    _ui(c, f"/api/org/invites/{code}/revoke", "PATCH")
+    state2 = _access_state(c)
+    assert state2 != state
+    [after] = deploy(decl, inventory=inv)
+    assert after["problems"] == [] and after["changed"] == []
+    assert _access_state(c) == state2, "nothing was put back"
 
-    # 8. the board keeps no viewers of its own: its grant goes, the team is
-    #    reported stale (never deleted automatically)
-    SENS2["folders"][0]["boards"][1]["viewers"] = []
-    decl3 = _write(tmp_path, SENS2, {})
-    [r5] = deploy(decl3, inventory=inv, access_only=True)
-    assert "removed team 'alpha · bk-b' from bk-b" in r5["changed"], r5["changed"]
-    assert any("alpha · bk-b" in w for w in r5["warnings"]), "stale team reported"
-    assert _status(internal, "/api/dashboards/uid/bk-b") == 200, "folder viewers keep it"
-    print("permission propagation:", WAITS)
+    # 5. the old behaviour is structurally gone: the client refuses
+    with pytest.raises(AccessIsGrafanas):
+        admin("/api/teams", "POST", {"name": "boardkit team"})
 
 
 def _same(a, b, path=""):
@@ -300,15 +295,15 @@ def _query(g: Grafana, ds_uid: str, sql: str, org_id: int | None = None):
 
 
 def test_isolated_org_journey(tmp_path, tmp_inventory, grafana_container, monkeypatch):
-    """A sensitive project whose client may open only their board, and must not
-    read the rows behind any other: the board is ALSO published into an org of
-    the client's own, through a database role that sees only their rows.
+    """A sensitive project whose client may read only their rows: the board is
+    ALSO published into an org of the client's own, through a database role that
+    sees only their rows. boardkit makes the orgs, boards and datasources; who is
+    in which org is the operator's, set here in Grafana's own API.
 
-    deploy -> the internal viewer is invited into the project's org, the client
-    into theirs -> both register -> a client who already had an account in the
-    main org is moved out of it -> the client lands in their org, their board
-    is the home page, their datasource returns ONLY their rows, and they are in
-    no other org; the internal viewer reads everything in the project's org."""
+    deploy -> orgs, folders, boards and datasources exist -> the operator seats
+    the client in their org only, and the internal viewer in the project's org
+    -> the client's datasource returns ONLY their rows and they reach nothing of
+    the other org -> deploying again leaves the seating alone."""
     c = grafana_container
     admin = _admin(c)
     monkeypatch.setenv("E2E_PG_ALL", c["pg_passwords"]["ro_all"])
@@ -331,73 +326,58 @@ password_var = "E2E_PG_A"
 sslmode = "disable"
 ''')
     inv = load_inventory(inv_path)
-    # someone who already has an account in the MAIN org (as a manager who
-    # registered before isolation existed)
-    admin("/api/admin/users", "POST", {"name": "early", "email": "early@example.com",
-                                       "login": "early@example.com",
-                                       "password": "Correct-horse-9"})
     decl = _write(tmp_path, {
         "project": "rho", "audience": "internal", "sensitivity": "sensitive",
         "datasources": {"${DS_MAIN}": "rho_all"},
         "folders": [{"uid": "rho", "title": "Rho", "org": "Rho",
-                     "viewers": ["ops@example.com"],
                      "boards": [
-                         {"file": "r1.json", "viewers": ["cli@example.com", "early@example.com"],
-                          "org": "Rho · a", "home": True,
+                         {"file": "r1.json", "org": "Rho · a",
                           "datasources": {"${DS_MAIN}": "rho_a"}},
                          {"file": "r2.json"}]}]},
         {"r1.json": plain("rho-r1", "Client A", "${DS_MAIN}"),
          "r2.json": plain("rho-r2", "Internal", "${DS_MAIN}")})
 
     [r] = deploy(decl, inventory=inv)
-    _keep(r)
+    assert r["problems"] == [], r["problems"]
     assert sorted((p["uid"], p["org"]) for p in r["published"]) == \
         [("rho-r1", "Rho"), ("rho-r1", "Rho · a"), ("rho-r2", "Rho")]
-    assert set(r["new_accounts"]) == {"ops@example.com", "cli@example.com"}
-    # an account boardkit did not create is never trusted on its own
-    assert [p for p in r["problems"] if p.startswith("early@example.com: already held")], r
-    assert len(r["problems"]) == 1, r["problems"]
-    monkeypatch.setenv("BOARDKIT_HOSTS", str(inv_path))
-    from boardkit.cli import main as cli
-    with pytest.raises(SystemExit) as done:
-        cli(["adopt", "early@example.com"])
-    assert done.value.code == 0
-    [r2] = deploy(decl, inventory=inv, access_only=True)
-    assert r2["problems"] == [], r2["problems"]
-    assert "removed early@example.com from the main org (their boards are isolated; " \
-           "there they could query its datasources)" in r2["changed"], r2["changed"]
-    [r3] = deploy(decl, inventory=inv, access_only=True)
-    assert r3["warnings"] == [], "isolated: nobody can read rows behind a board they cannot open"
-
     orgs = {o["name"]: o["id"] for o in admin("/api/orgs")}
-    for email in ("cli@example.com", "early@example.com"):
-        u = _as(c, email)            # early keeps the password it was created with
-        assert u("/api/user")["orgId"] == orgs["Rho · a"], f"{email} lands in their own org"
-        assert {o["name"] for o in u("/api/user/orgs")} == {"Rho · a"}, "and in no other"
-        assert u("/api/dashboards/home")["redirectUri"].startswith("/d/rho-r1/")
-        assert _status(u, "/api/dashboards/uid/rho-r1") == 200
-        assert _status(u, "/api/dashboards/uid/rho-r2") == 404, "not in their org at all"
-        assert _query(u, "bk-rho-a", "select account from book") == ["a", "a"], \
-            "their datasource returns only their rows"
-        # an org they are not in: Grafana either refuses the header or serves
-        # their own org instead. Either way, nothing of that org reaches them:
-        for other in (orgs["Rho"], 1):
-            go = u.in_org(other)
-            try:
-                seen = {d["uid"] for d in go("/api/search?type=dash-db")}
-            except GrafanaError as e:
-                assert e.status in (401, 403), e
-                seen = set()
-            assert seen <= {"rho-r1"}, f"{email} sees {seen} via org {other}"
-            with pytest.raises(GrafanaError) as denied:
-                _query(u, "bk-rho-all", "select account from book", other)
-            assert denied.value.status in (400, 401, 403, 404), denied.value
-        with pytest.raises(GrafanaError):
-            _query(u, "bk-rho-all", "select account from book")   # not in their org
+
+    # the operator seats people: the client in their org only, ops in the project's
+    for email, org in (("cli@example.com", "Rho · a"), ("ops@example.com", "Rho")):
+        _ui(c, "/api/admin/users", "POST", {"name": email, "email": email, "login": email,
+                                            "password": PASSWORD, "OrgId": orgs[org]})
+    seated = {o: sorted(u["login"] for u in _ui(c, f"/api/orgs/{i}/users"))
+              for o, i in orgs.items() if o.startswith("Rho")}
+
+    u = _as(c, "cli@example.com")
+    assert u("/api/user")["orgId"] == orgs["Rho · a"], "the client lands in their own org"
+    assert {o["name"] for o in u("/api/user/orgs")} == {"Rho · a"}, "and in no other"
+    assert _status(u, "/api/dashboards/uid/rho-r1") == 200
+    assert _status(u, "/api/dashboards/uid/rho-r2") == 404, "not in their org at all"
+    assert _query(u, "bk-rho-a", "select account from book") == ["a", "a"], \
+        "their datasource returns only their rows"
+    for other in (orgs["Rho"], 1):               # an org they are not in: nothing of it
+        go = u.in_org(other)
+        try:
+            seen = {d["uid"] for d in go("/api/search?type=dash-db")}
+        except GrafanaError as e:
+            assert e.status in (401, 403), e
+            seen = set()
+        assert seen <= {"rho-r1"}, f"cli sees {seen} via org {other}"
+        with pytest.raises(GrafanaError) as denied:
+            _query(u, "bk-rho-all", "select account from book", other)
+        assert denied.value.status in (400, 401, 403, 404), denied.value
     ops = _as(c, "ops@example.com")
     assert _query(ops, "bk-rho-all", "select account from book", orgs["Rho"]) == ["a", "a", "b"]
     assert {d["uid"] for d in ops.in_org(orgs["Rho"])("/api/search?type=dash-db")} == \
         {"rho-r1", "rho-r2"}
+
+    # deploying again leaves the seating alone
+    [r2] = deploy(decl, inventory=inv)
+    assert r2["problems"] == [] and r2["changed"] == [], r2
+    assert {o: sorted(x["login"] for x in _ui(c, f"/api/orgs/{i}/users"))
+            for o, i in orgs.items() if o.startswith("Rho")} == seated
 
     # the audit's main-org views describe the main org whichever org the admin
     # last switched to (an unheaded call acts in the CURRENT org: it once read 3)
@@ -407,6 +387,5 @@ sslmode = "disable"
         a = audit(admin)
         assert "bk-rho-all" not in " ".join(a["datasources"]), a["datasources"]
         assert not any("rho" in f for f in a["folders"]), a["folders"]
-        assert not any(x.startswith("ops@example.com") for x in a["accounts"]), a["accounts"]
     finally:
         admin("/api/user/using/1", "POST")

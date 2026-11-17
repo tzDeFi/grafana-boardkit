@@ -4,31 +4,23 @@ Audience picks the host: a board for David alone lives on his own machine, a
 board for anyone else on the team host. Sensitivity picks the rules:
 
   sensitive   the host must require login (no anonymous role at all);
-              viewers are explicit emails, never "all";
-              no builtin role (Viewer / Editor) may hold a grant on its folders.
-  open        "all" is allowed: every account on the host may view.
+  open        no extra rule.
+
+Who may open a board is Grafana's to decide, not boardkit's (see decl.py), so
+no rule here is about people.
 
 One risk no permission can close on Grafana OSS: any org member can POST
-/api/ds/query with hand-written SQL to any datasource in the org. For a
-sensitive project, every apply counts, per org, the accounts that can query
-the data behind a board they cannot open (deploy._exposure). The fix is an org
-per audience (datasources are per org) with a database role that sees only
-that audience's rows: `org` on a folder or board in the declaration.
+/api/ds/query with hand-written SQL to any datasource in the org. So whoever
+adds someone to an org adds them to its datasources. The fix is an org per
+audience (datasources are per org) with a database role that sees only that
+audience's rows: `org` on a folder or board in the declaration. `boardkit
+audit` lists every org's members next to its datasources.
 """
 from __future__ import annotations
 
 import re
 
-from .decl import ALL, Declaration
-
-
-def static_errors(decl: Declaration) -> list[str]:
-    errs = []
-    if decl.sensitivity == "sensitive":
-        for f in decl.folders:
-            if f.viewers == ALL:
-                errs.append(f"folder {f.uid}: a sensitive project cannot grant \"all\"")
-    return errs
+from .decl import Declaration
 
 
 def host_errors(decl: Declaration, host, settings: dict) -> list[str]:

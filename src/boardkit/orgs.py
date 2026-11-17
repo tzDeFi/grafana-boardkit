@@ -22,10 +22,6 @@ def ensure_org(g: Grafana, name: str, log: list[str]) -> int:
     return oid
 
 
-def org_members(g: Grafana, oid: int) -> dict[str, dict]:
-    return {u["email"].lower(): u for u in g(f"/api/orgs/{oid}/users")}
-
-
 def datasource_uid(logical: str) -> str:
     return (DS_PREFIX + logical.replace("_", "-"))[:40]
 
