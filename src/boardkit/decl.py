@@ -1,7 +1,7 @@
-"""The declaration a repo keeps next to its boards: what to deploy, to whom.
+"""The declaration a repo keeps next to its boards: what to deploy, and where.
 
-    project     = "risk"            # names the repo's teams and its store on the host
-    audience    = "internal"        # internal -> the team host; me -> David's own host
+    project     = "risk"            # names the repo's store on the host
+    audience    = "internal"        # internal -> the team host; me -> the owner's own host
     sensitivity = "sensitive"       # sensitive | open
 
     [datasources]                   # reference in the board JSON -> logical name
@@ -10,36 +10,33 @@
     [[folders]]
     uid     = "risk"
     title   = "Risk"
-    viewers = ["a@x.com"]           # folder-wide; "all" = every account (open only)
-    team    = "Risk desk"           # optional: keep an existing team's name
     tabs    = true                  # publish boards with rows as real tabs
 
       [[folders.boards]]
       file    = "grafana/book-a.json"
-      viewers = ["m@y.com"]         # this board only
-      team    = "Client A"          # optional
-      home    = true                # the board is those viewers' home page
       preference_vars = ["loss"]    # carried over even under --reset-vars
 
+Who may open a board is NOT declared here. It is set in Grafana (Administration,
+Users and access), and boardkit never reads or changes it: no users, teams,
+org members, folder or board permissions, home pages. `viewers`, `team` and
+`home` are refused, so a repo cannot grow a second access system.
+
 Orgs (a sensitive project's real boundary: Grafana OSS lets any org member
-query any of that org's datasources, so only an org keeps a viewer out of
-data they may not see):
+query any of that org's datasources, so only an org keeps a person out of data
+they may not see). boardkit creates the org and the datasources in it; who is a
+member of it is Grafana's:
 
     [[folders]]
     org = "Risk"                    # the folder lives in its own org; its
     [folders.datasources]           # datasources are created there from the
     "${DS_MAIN}" = "risk_all"       # host inventory's [datasource_defs]
       [[folders.boards]]
-      viewers = ["m@y.com"]
       org     = "Risk · client-a"   # ISOLATED: also published into this org,
-      [folders.boards.datasources]  # where its viewers are the only members,
-      "${DS_MAIN}" = "risk_client_a" # through a datasource that sees their rows
-
-A project owns every org it names: members are exactly the declared viewers.
-Someone who is a viewer only inside such orgs is taken out of the main org.
+      [folders.boards.datasources]  # through a datasource that sees fewer rows
+      "${DS_MAIN}" = "risk_client_a"
 
 TOML or JSON. Unknown keys are rejected: a typo must not silently drop a
-restriction. Paths are relative to the declaration file.
+setting. Paths are relative to the declaration file.
 """
 from __future__ import annotations
 
@@ -51,10 +48,12 @@ from pathlib import Path
 
 AUDIENCES = ("me", "internal")
 SENSITIVITIES = ("sensitive", "open")
-ALL = "all"
 MAIN_ORG_NAMES = ("Main Org.", "Main Org")
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
-_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+#: keys boardkit <= 0.3 used to put access in a declaration. Refused in a repo's
+#: declaration; ignored in a bundle an older boardkit stored on a host.
+RETIRED_KEYS = ("viewers", "team", "home")
 
 
 class DeclarationError(ValueError):
@@ -66,12 +65,9 @@ class Board:
     file: Path
     uid: str
     title: str
-    viewers: list[str] = field(default_factory=list)
-    team: str | None = None
-    home: bool = False
     preference_vars: list[str] = field(default_factory=list)
     tabs: bool | None = None
-    org: str | None = None                      # isolated into its own org
+    org: str | None = None                      # also published into its own org
     datasources: dict[str, str] = field(default_factory=dict)
 
 
@@ -79,8 +75,6 @@ class Board:
 class Folder:
     uid: str
     title: str
-    viewers: list[str] | str = field(default_factory=list)   # list or ALL
-    team: str | None = None
     tabs: bool = False
     boards: list[Board] = field(default_factory=list)
     org: str | None = None                      # None = the main org
@@ -95,20 +89,6 @@ class Declaration:
     datasources: dict[str, str]
     folders: list[Folder]
     root: Path
-
-    # ── derived names ─────────────────────────────────────────────────────
-    def team_prefix(self) -> str:
-        return f"{self.project} · "
-
-    def folder_team(self, f: Folder) -> str | None:
-        if f.viewers == ALL:
-            return None
-        return f.team or f"{self.team_prefix()}{f.title}"
-
-    def board_team(self, b: Board) -> str | None:
-        if not b.viewers:
-            return None
-        return b.team or f"{self.team_prefix()}{b.uid}"
 
     def boards(self):
         for f in self.folders:
@@ -129,35 +109,32 @@ class Declaration:
             "project": self.project, "audience": self.audience,
             "sensitivity": self.sensitivity, "datasources": dict(self.datasources),
             "folders": [{
-                "uid": f.uid, "title": f.title, "viewers": f.viewers, "team": f.team,
-                "tabs": f.tabs, "org": f.org, "datasources": dict(f.datasources),
-                "boards": [{"file": board_path(b), "viewers": b.viewers, "team": b.team,
-                            "home": b.home, "preference_vars": b.preference_vars,
+                "uid": f.uid, "title": f.title, "tabs": f.tabs, "org": f.org,
+                "datasources": dict(f.datasources),
+                "boards": [{"file": board_path(b), "preference_vars": b.preference_vars,
                             "tabs": b.tabs, "org": b.org, "datasources": dict(b.datasources)}
                            for b in f.boards]}
                 for f in self.folders]}
 
 
-def _keys(d: dict, allowed: set, where: str) -> None:
-    extra = set(d) - allowed
+def placements(decl: Declaration):
+    """(org name | None, folder, board, isolated): every place a board is published."""
+    for f in decl.folders:
+        for b in f.boards:
+            yield f.org, f, b, False
+            if b.org:
+                yield b.org, f, b, True
+
+
+def _keys(d: dict, allowed: set, where: str, legacy: bool = False) -> None:
+    retired = sorted(set(d) & set(RETIRED_KEYS))
+    if retired and not legacy:
+        raise DeclarationError(
+            f"{where}: {retired} is retired (boardkit 0.4): who can open a board is set in "
+            "Grafana (Administration, Users and access), never in a declaration. Remove it.")
+    extra = set(d) - allowed - (set(RETIRED_KEYS) if legacy else set())
     if extra:
         raise DeclarationError(f"{where}: unknown keys {sorted(extra)}")
-
-
-def _emails(v, where: str, allow_all: bool) -> list[str] | str:
-    if v == ALL and allow_all:
-        return ALL
-    if not isinstance(v, list):
-        raise DeclarationError(f"{where}: viewers must be a list of emails"
-                               + (' or "all"' if allow_all else ""))
-    out = []
-    for e in v:
-        if not isinstance(e, str) or not _EMAIL.match(e.strip()):
-            raise DeclarationError(f"{where}: {e!r} is not an email")
-        out.append(e.strip().lower())
-    if len(set(out)) != len(out):
-        raise DeclarationError(f"{where}: duplicate viewers")
-    return sorted(out)
 
 
 def _org(v, where: str) -> str | None:
@@ -175,7 +152,9 @@ def _dsmap(d: dict, where: str) -> dict[str, str]:
     return dict(m)
 
 
-def from_dict(d: dict, root: Path) -> Declaration:
+def from_dict(d: dict, root: Path, *, legacy: bool = False) -> Declaration:
+    """`legacy`: a bundle stored by boardkit <= 0.3 on a host, which still carries
+    the retired access keys. They are ignored, never acted on."""
     _keys(d, {"project", "audience", "sensitivity", "datasources", "folders"}, "declaration")
     project = d.get("project", "")
     if not _SLUG.match(project):
@@ -190,18 +169,15 @@ def from_dict(d: dict, root: Path) -> Declaration:
     folders, uids = [], set()
     for i, fd in enumerate(d.get("folders", [])):
         where = f"folders[{i}]"
-        _keys(fd, {"uid", "title", "viewers", "team", "tabs", "boards", "org", "datasources"},
-              where)
+        _keys(fd, {"uid", "title", "tabs", "boards", "org", "datasources"}, where, legacy)
         if not _SLUG.match(fd.get("uid", "")):
             raise DeclarationError(f"{where}: uid must be a slug (<= 40 chars)")
         f = Folder(uid=fd["uid"], title=fd.get("title") or fd["uid"],
-                   viewers=_emails(fd.get("viewers", []), where, allow_all=True),
-                   team=fd.get("team"), tabs=bool(fd.get("tabs", False)),
+                   tabs=bool(fd.get("tabs", False)),
                    org=_org(fd.get("org"), where), datasources=_dsmap(fd, where))
         for j, bd in enumerate(fd.get("boards", [])):
             bwhere = f"{where}.boards[{j}]"
-            _keys(bd, {"file", "viewers", "team", "home", "preference_vars", "tabs", "org",
-                       "datasources"}, bwhere)
+            _keys(bd, {"file", "preference_vars", "tabs", "org", "datasources"}, bwhere, legacy)
             path = (root / bd["file"]).resolve()
             if not path.is_file():
                 raise DeclarationError(f"{bwhere}: no board file {bd['file']}")
@@ -213,15 +189,9 @@ def from_dict(d: dict, root: Path) -> Declaration:
                 raise DeclarationError(f"{bwhere}: board uid {uid} declared twice")
             uids.add(uid)
             b = Board(file=path, uid=uid, title=board.get("title", uid),
-                      viewers=_emails(bd.get("viewers", []), bwhere, allow_all=False),
-                      team=bd.get("team"), home=bool(bd.get("home", False)),
                       preference_vars=list(bd.get("preference_vars", [])),
                       tabs=bd.get("tabs"), org=_org(bd.get("org"), bwhere),
                       datasources=_dsmap(bd, bwhere))
-            if b.home and not b.viewers:
-                raise DeclarationError(f"{bwhere}: home = true needs board viewers")
-            if b.org and not b.viewers:
-                raise DeclarationError(f"{bwhere}: an isolated board (org) needs viewers")
             if b.org and b.org == f.org:
                 raise DeclarationError(f"{bwhere}: org {b.org!r} is the folder's own org")
             if b.datasources and not b.org:
@@ -231,13 +201,8 @@ def from_dict(d: dict, root: Path) -> Declaration:
         folders.append(f)
     if not folders:
         raise DeclarationError("a declaration needs at least one [[folders]]")
-    decl = Declaration(project=project, audience=d["audience"], sensitivity=d["sensitivity"],
+    return Declaration(project=project, audience=d["audience"], sensitivity=d["sensitivity"],
                        datasources=dict(ds), folders=folders, root=root)
-    teams = [decl.folder_team(f) for f in folders] + [decl.board_team(b) for _, b in decl.boards()]
-    teams = [t for t in teams if t]
-    if len(set(teams)) != len(teams):
-        raise DeclarationError(f"two groups share a team name: {teams}")
-    return decl
 
 
 def load(path: str | Path) -> Declaration:

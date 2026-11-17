@@ -1,4 +1,30 @@
-# boardkit — architecture
+# boardkit: architecture
+
+## Decision 2026-11-17 (0.4.0): boardkit does not manage access
+
+Until 0.3 boardkit also converged who may open each board (accounts, teams,
+folder and board grants, home pages) on every deploy and on a host timer, and
+took out whatever an operator had added by hand. The operator wants every
+dashboard on the host controlled in Grafana's own admin pages and nowhere else:
+Grafana already has users, teams and permissions, and a second system that
+overwrites the first means an invite made in the UI is gone within minutes.
+
+So access is out of boardkit entirely. It is made unreachable rather than
+discouraged: the Grafana client refuses writes to the access endpoints
+(`AccessIsGrafanas`), the declaration refuses `viewers`, `team` and `home`, and
+there is no timer command left to point a cron at. An end-to-end test acts as the
+operator in the UI, deploys and re-applies, and requires the access state to be
+byte-identical, and what the operator removed to stay removed.
+
+Kept on purpose: `org` (a boundary for datasources, which Grafana OSS draws per
+org), the anonymous-host refusal for sensitive projects, and `audit` (read-only).
+Dropped: the per-deploy "accounts that can query data behind boards they cannot
+open" warning, which needed declared viewers; `boardkit audit` lists each org's
+members next to its datasources instead.
+
+Everything below this line that describes accounts, pinning, teams, grants or the
+timer is the 0.3 design and is history.
+
 
 ## The problem it removes
 

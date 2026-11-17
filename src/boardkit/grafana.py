@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +19,26 @@ class GrafanaError(RuntimeError):
         super().__init__(f"{method} {path} -> {status}: {body[:300]}")
         self.status = status
         self.body = body
+
+
+class AccessIsGrafanas(RuntimeError):
+    """boardkit tried to change who can see something. It never does."""
+
+
+#: Everything that decides who may open what: users, org members, invites, teams,
+#: roles and permissions, folder and board permissions, home pages. Read-only for
+#: boardkit (the audit reads them); a write is refused before it leaves the process.
+_ACCESS_PATHS = re.compile(
+    r"^/api/(users|admin/users|org/users|orgs/[^/?]+/users|org/invites|invites|teams|"
+    r"access-control|serviceaccounts|org/preferences|user/preferences|preferences)(/|\?|$)"
+    r"|/permissions(/|\?|$)|/preferences(/|\?|$)")
+
+
+def _refuse_access_write(method: str, path: str) -> None:
+    if method.upper() not in ("GET", "HEAD") and _ACCESS_PATHS.search(path):
+        raise AccessIsGrafanas(
+            f"{method} {path}: boardkit never changes who can see a board. Do it in "
+            "Grafana (Administration, Users and access).")
 
 
 class Grafana:
@@ -40,6 +61,7 @@ class Grafana:
             self.headers["X-Grafana-Org-Id"] = str(org_id)
 
     def __call__(self, path: str, method: str = "GET", body=None, *, ok404: bool = False):
+        _refuse_access_write(method, path)
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.url + path, data=data, method=method,
                                      headers=self.headers)
@@ -75,13 +97,6 @@ class Grafana:
     def namespace(self) -> str:
         """k8s namespace of the app-platform APIs: `default` on OSS org 1."""
         return self("/api/frontend/settings").get("namespace") or "default"
-
-    def user_by_email(self, email: str) -> dict | None:
-        return self(f"/api/users/lookup?loginOrEmail={urllib.parse.quote(email)}", ok404=True)
-
-    def team_by_name(self, name: str) -> dict | None:
-        hits = self(f"/api/teams/search?perpage=1000&name={urllib.parse.quote(name)}")["teams"]
-        return next((t for t in hits if t["name"] == name), None)
 
 
 def q(s: str) -> str:
