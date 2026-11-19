@@ -1,5 +1,20 @@
 # boardkit: architecture
 
+## Decision 2026-11-19 (0.4.1): a dashboard link is carried, and read back
+
+0.4.0 (and every version since the v2 converter) wrote `links: []` on every board it published
+as v2, whatever the board said. A repo that generated a "Record AUM" link on each board shipped
+boards without it, and the deploy read back "in sync": the check compared the panels, the tabs
+and the time settings, not the links. The class is "a key of the classic board the converter
+neither maps nor refuses, dropped without a word"; panels already refused that way, the
+dashboard level did not.
+
+So `links` now map key for key to v2 (Grafana's own conversion, pinned live, fills the keys a
+link leaves out), a link the converter cannot map raises, and the read-back asks Grafana for
+every declared link, in order, from the classic board (never from the converter's output), on
+both publish paths. Still dropped at the dashboard level, unchanged: `refresh_intervals`,
+`hidden`, and panel-level `links`.
+
 ## Decision 2026-11-17 (0.4.0): boardkit does not manage access
 
 Until 0.3 boardkit also converged who may open each board (accounts, teams,

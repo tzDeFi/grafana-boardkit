@@ -30,6 +30,11 @@ _REFRESH_INTERVALS = ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h",
                       "2h", "1d"]
 _CURSOR = {0: "Off", 1: "Crosshair", 2: "Tooltip"}
 _QUICK_RANGE_KEYS = {"display", "from", "to"}
+#: a classic dashboard link, and what Grafana's own v1 -> v2 conversion fills in for a key the
+#: board leaves out (pinned live by tests/test_e2e_grafana.py)
+_LINK_DEFAULTS = {"asDropdown": False, "icon": "", "includeVars": False, "keepTime": False,
+                  "tags": [], "targetBlank": False, "tooltip": "", "url": ""}
+_LINK_TYPES = {"link", "dashboards"}
 
 BUILTIN_ANNOTATION = {
     "kind": "AnnotationQuery",
@@ -142,6 +147,27 @@ def tabs(board: dict) -> list[tuple[str, int, list[dict]]]:
     return out
 
 
+def _links(board: dict) -> list[dict]:
+    """Classic dashboard `links` -> v2 `spec.links`, key for key. Until 0.4.1 the converter wrote
+    `links: []` whatever the board said, so a link a repo generated (a "Record AUM" link) never
+    reached the deployed board and the read-back, which did not look, called it in sync. A link
+    the converter cannot carry raises, like a panel it cannot carry."""
+    links = board.get("links") or []
+    if not isinstance(links, list):
+        raise ValueError("links must be a list of dashboard links")
+    out = []
+    for i, link in enumerate(links):
+        if not isinstance(link, dict):
+            raise ValueError(f"link {i}: must be an object")
+        extra = set(link) - set(_LINK_DEFAULTS) - {"title", "type"}
+        if extra:
+            raise ValueError(f"link {i}: keys the converter does not map: {extra}")
+        if not link.get("title") or link.get("type") not in _LINK_TYPES:
+            raise ValueError(f"link {i}: needs a title and a type of {sorted(_LINK_TYPES)}")
+        out.append({**copy.deepcopy(_LINK_DEFAULTS), **copy.deepcopy(link)})
+    return out
+
+
 def _quick_ranges(board: dict) -> dict:
     """Classic `timepicker.quick_ranges` -> v2 `timeSettings.quickRanges`, the
     mapping Grafana's own conversion makes (pinned live by tests/test_e2e_grafana.py).
@@ -195,7 +221,7 @@ def to_v2(board: dict, folder_uid: str | None = None) -> dict:
             "editable": board.get("editable", True),
             "elements": elements,
             "layout": layout,
-            "links": [],
+            "links": _links(board),
             "liveNow": False,
             "preload": False,
             "tags": list(board.get("tags", [])),
