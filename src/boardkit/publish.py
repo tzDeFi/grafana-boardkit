@@ -102,6 +102,20 @@ def _time_problems(board: dict, have: dict) -> list[str]:
             for k, v in _declared_time(board).items() if have.get(k) != v]
 
 
+def _link_problems(board: dict, have: list | None) -> list[str]:
+    """Every dashboard link the declaration sets must read back as declared, in order (a link
+    the converter does not carry is dropped silently, and a 200 says nothing about it: 0.4.0
+    shipped the "Record AUM" link of a board and read back "in sync" without it). Read from the
+    CLASSIC board, not to_v2's output, so a converter that drops a link cannot agree with itself.
+    Grafana adds defaults for the keys a link leaves out; only the declared keys are compared."""
+    want, have = board.get("links") or [], have or []
+    if len(have) != len(want):
+        return [f"links: read back {len(have)}, declared {len(want)}"]
+    return [f"link {i} ({w.get('title')!r}) {k}: read back {h.get(k)!r}, declared {v!r}"
+            for i, (w, h) in enumerate(zip(want, have, strict=True))
+            for k, v in w.items() if h.get(k) != v]
+
+
 def _put_classic(g: Grafana, board: dict, folder_uid: str, message: str) -> list[str]:
     b = copy.deepcopy(board)
     b["id"] = None
@@ -122,7 +136,7 @@ def _put_classic(g: Grafana, board: dict, folder_uid: str, message: str) -> list
     if _flat_titles(got["dashboard"].get("panels", [])) != _flat_titles(board.get("panels", [])):
         problems.append("panels read back differ from the panels sent")
     d = got["dashboard"]
-    return problems + _time_problems(board, {
+    return problems + _link_problems(board, d.get("links")) + _time_problems(board, {
         **(d.get("time") or {}), "timezone": d.get("timezone"),
         "quickRanges": (d.get("timepicker") or {}).get("quick_ranges")})
 
@@ -158,7 +172,8 @@ def _put_v2(g: Grafana, board: dict, folder_uid: str) -> list[str]:
         n = len(board["panels"])
     if len(got["spec"]["elements"]) != n:
         problems.append(f"{len(got['spec']['elements'])} panels read back, sent {n}")
-    return problems + _time_problems(board, got["spec"].get("timeSettings") or {})
+    return (problems + _link_problems(board, got["spec"].get("links"))
+            + _time_problems(board, got["spec"].get("timeSettings") or {}))
 
 
 def publish_board(g: Grafana, board: dict, folder_uid: str, *, tabs: bool = False,

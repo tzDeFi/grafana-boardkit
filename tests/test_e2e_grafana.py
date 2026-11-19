@@ -23,7 +23,7 @@ from boardkit.grafana import AccessIsGrafanas, Grafana, GrafanaError
 from boardkit.hosts import load_inventory
 from boardkit.v2 import to_v2
 
-from .boards import QUICK_RANGES, plain, tabbed
+from .boards import LINKS, LINKS_MIN, QUICK_RANGES, plain, tabbed
 
 pytestmark = pytest.mark.e2e
 
@@ -209,9 +209,13 @@ def _same(a, b, path=""):
     (tabbed, None, "conv-tabbed"), (plain, None, "conv-plain"),
     (tabbed, {"quick_ranges": QUICK_RANGES}, "conv-tabbed-qr"),
     (plain, {"quick_ranges": QUICK_RANGES}, "conv-plain-qr"),
-    (plain, {"quick_ranges": []}, "conv-plain-qr-empty")],
+    (plain, {"quick_ranges": []}, "conv-plain-qr-empty"),
+    (tabbed, {"links": LINKS}, "conv-tabbed-links"),
+    (plain, {"links": LINKS[:1]}, "conv-plain-links"),
+    (plain, {"links": LINKS_MIN}, "conv-plain-links-min")],
     ids=["rows", "no-rows", "rows+quick-ranges", "no-rows+quick-ranges",
-         "no-rows+empty-quick-ranges"])
+         "no-rows+empty-quick-ranges", "rows+links", "no-rows+one-link",
+         "no-rows+minimal-link"])
 def test_converter_matches_grafanas_own_conversion(grafana_container, datasource, make, picker,
                                                    uid):
     """Store the classic board through the legacy API, read Grafana's v2
@@ -220,7 +224,9 @@ def test_converter_matches_grafanas_own_conversion(grafana_container, datasource
     carries them as timeSettings.quickRanges, in order, and an empty list as none."""
     admin = _admin(grafana_container)
     board = make(uid=uid, ds_ref="pg-main")
-    if picker:
+    if picker and "links" in picker:
+        board["links"] = picker["links"]
+    elif picker:
         board["timepicker"] = picker
     for p in board["panels"]:
         for o in [p, *p.get("targets", [])]:
@@ -283,6 +289,48 @@ def test_deploy_carries_quick_ranges_and_reports_a_dropped_one(
     assert [p for p in r2["problems"]
             if p.startswith("bk-qr-t: time setting quickRanges: read back None")], r2["problems"]
     assert not [p for p in r2["problems"] if "bk-qr-c" in p], "the classic board is unaffected"
+
+
+LINKED = {"project": "lk", "audience": "internal", "sensitivity": "sensitive",
+          "datasources": {"${DS_MAIN}": "main", "maindb": "main"},
+          "folders": [{"uid": "bk-lk", "title": "Links", "tabs": True, "boards": [
+              {"file": "t.json"}, {"file": "c.json", "tabs": False}]}]}
+
+
+def test_deploy_carries_dashboard_links_and_reports_a_dropped_one(
+        tmp_path, tmp_inventory, grafana_container, datasource, monkeypatch):
+    """0.4.0 wrote `links: []` on the way to v2 and the deploy read back clean: a link a repo
+    generated ("Record AUM") never reached the deployed board. Now the links of a board come
+    back from Grafana as declared, on both publish paths; and a converter that loses them is a
+    problem in the deploy's report."""
+    admin, inv = _admin(grafana_container), load_inventory(tmp_inventory)
+    tabbed_board, classic_board = tabbed("bk-lk-t"), plain("bk-lk-c", "Classic", "${DS_MAIN}")
+    for b in (tabbed_board, classic_board):
+        b["links"] = LINKS
+    decl = _write(tmp_path, LINKED, {"t.json": tabbed_board, "c.json": classic_board})
+
+    [r] = deploy(decl, inventory=inv)
+    assert r["problems"] == [], r["problems"]
+    ns = admin.namespace()
+    v2 = admin(f"/apis/dashboard.grafana.app/v2/namespaces/{ns}/dashboards/bk-lk-t")
+    assert v2["spec"]["layout"]["kind"] == "TabsLayout"
+    assert [(link["title"], link["url"], link["targetBlank"]) for link in v2["spec"]["links"]] == [
+        ("Record AUM", LINKS[0]["url"], True), ("Related", "", False)]
+    classic = admin("/api/dashboards/uid/bk-lk-c")["dashboard"]
+    assert [link["title"] for link in classic["links"]] == ["Record AUM", "Related"]
+
+    real = publish.to_v2
+
+    def dropping(board, folder_uid=None):
+        res = real(board, folder_uid)
+        res["spec"]["links"] = []
+        return res
+
+    monkeypatch.setattr(publish, "to_v2", dropping)
+    [r2] = deploy(decl, inventory=inv)
+    assert [p for p in r2["problems"] if p.startswith("bk-lk-t: links: read back 0, declared 2")], \
+        r2["problems"]
+    assert not [p for p in r2["problems"] if "bk-lk-c" in p], "the classic board is unaffected"
 
 
 def _query(g: Grafana, ds_uid: str, sql: str, org_id: int | None = None):

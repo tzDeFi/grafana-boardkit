@@ -4,7 +4,7 @@ Deploy Grafana boards from one declaration per repo. **Who may open them is
 Grafana's to decide, never boardkit's.**
 
 ```bash
-pip install "boardkit @ git+https://github.com/tzDeFi/grafana-boardkit@v0.4.0"
+pip install "boardkit @ git+https://github.com/tzDeFi/grafana-boardkit@v0.4.1"
 boardkit plan   boards.toml      # validate; show what it publishes
 boardkit deploy boards.toml      # ship to the audience's host and publish there
 ```

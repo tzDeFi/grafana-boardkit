@@ -10,6 +10,21 @@ QUICK_RANGES = [{"display": "Yesterday", "from": "now-1d/d", "to": "now-1d/d"},
                 {"display": "Last 7 days", "from": "now-7d", "to": "now"}]
 
 
+#: dashboard links as a repo emits them (the generator JSON of a real board carries one "open this
+#: other page" link; the second is the dropdown form with tags)
+LINKS = [{"title": "Record AUM", "type": "link", "icon": "external link",
+          "url": "https://example.invalid/aum?account=alpha", "targetBlank": True,
+          "includeVars": False, "keepTime": False, "asDropdown": False,
+          "tooltip": "Opens its own page"},
+         {"title": "Related", "type": "dashboards", "icon": "dashboard", "tags": ["boardkit-e2e"],
+          "asDropdown": True, "includeVars": True, "keepTime": True, "targetBlank": False,
+          "tooltip": "", "url": ""}]
+
+
+#: the least a classic link says: Grafana fills the rest in with its own defaults
+LINKS_MIN = [{"title": "Docs", "type": "link", "url": "https://example.invalid/docs"}]
+
+
 def _panel(pid, title, kind, y, ds, sql, x=0, w=12, h=6):
     p = {"id": pid, "title": title, "type": kind,
          "gridPos": {"x": x, "y": y, "w": w, "h": h},

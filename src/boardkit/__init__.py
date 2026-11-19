@@ -5,4 +5,4 @@ inventory (boardkit.hosts) says where each audience lives. boardkit never reads
 or changes users, teams, org members or permissions (boardkit.grafana refuses
 the writes). See README.md.
 """
-__version__ = "0.4.0"
+__version__ = "0.4.1"

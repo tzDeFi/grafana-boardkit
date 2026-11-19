@@ -16,7 +16,7 @@ from boardkit.policy import host_errors
 from boardkit.publish import carry_over_variables, publish_board
 from boardkit.v2 import to_v2
 
-from .boards import QUICK_RANGES, plain, tabbed
+from .boards import LINKS, LINKS_MIN, QUICK_RANGES, plain, tabbed
 
 
 def _decl(tmp_path, **over):
@@ -386,6 +386,59 @@ def test_a_quick_range_the_converter_cannot_map_raises(bad):
         to_v2(_with_quick(tabbed(), bad))
 
 
+# ── v2: dashboard links ─────────────────────────────────────────────────────
+
+def _with_links(board, links=LINKS):
+    board["links"] = copy.deepcopy(links)
+    return board
+
+
+def test_links_map_to_v2_in_the_declared_order_with_grafanas_defaults():
+    got = to_v2(_with_links(tabbed()))["spec"]["links"]
+    assert [(link["title"], link["type"]) for link in got] == [("Record AUM", "link"),
+                                                               ("Related", "dashboards")]
+    assert got[0]["url"] == LINKS[0]["url"] and got[0]["targetBlank"] is True
+    assert got[0]["tags"] == [], "a link that names no tags gets Grafana's empty list"
+    assert got[1]["tags"] == ["boardkit-e2e"] and got[1]["asDropdown"] is True
+    [minimal] = to_v2(_with_links(tabbed(), LINKS_MIN))["spec"]["links"]
+    assert minimal == {"title": "Docs", "type": "link", "url": "https://example.invalid/docs",
+                       "asDropdown": False, "icon": "", "includeVars": False, "keepTime": False,
+                       "tags": [], "targetBlank": False, "tooltip": ""}
+    b = _with_links(tabbed())
+    to_v2(b)["spec"]["links"][0]["title"] = "changed"
+    assert b["links"][0]["title"] == "Record AUM", "the output is a copy"
+
+
+@pytest.mark.parametrize("links", ["absent", None, []], ids=["absent", "null", "empty"])
+def test_no_links_leaves_the_output_as_it_was(links):
+    b = tabbed()
+    if links != "absent":
+        b["links"] = links
+    assert to_v2(b) == to_v2(tabbed())
+    assert to_v2(b)["spec"]["links"] == []
+
+
+def test_links_change_nothing_else_in_the_resource():
+    without, with_ = to_v2(tabbed(), "f1"), to_v2(_with_links(tabbed()), "f1")
+    assert len(with_["spec"].pop("links")) == 2
+    without["spec"].pop("links")
+    assert with_ == without
+
+
+@pytest.mark.parametrize("bad", [
+    [{**LINKS[0], "foo": 1}],
+    [{"type": "link", "url": "x"}],
+    [{"title": "x", "url": "x"}],
+    [{"title": "x", "type": "menu"}],
+    [LINKS[0], "https://example.invalid"],
+    {"title": "x", "type": "link"},
+], ids=["unknown-key", "no-title", "no-type", "bad-type", "second-not-an-object", "not-a-list"])
+def test_a_link_the_converter_cannot_map_raises(bad):
+    """Dropping it without a word is what 0.4.0 did."""
+    with pytest.raises(ValueError, match="link"):
+        to_v2(_with_links(tabbed(), bad))
+
+
 # ── publish: the time picker must read back as declared ──────────────────────
 
 class _Grafana:
@@ -479,3 +532,58 @@ def test_a_converter_that_drops_quick_ranges_cannot_pass(monkeypatch):
     monkeypatch.setattr(publish, "to_v2", dropping)
     [got] = _problems(_with_quick(tabbed()))
     assert got.startswith("time setting quickRanges: read back None"), got
+
+
+# ── publish: dashboard links must read back as declared ─────────────────────
+
+def _drop_links(tabs):
+    return ((lambda spec: spec.update(links=[])) if tabs
+            else (lambda board: board.pop("links")))
+
+
+def _edit_link(_tabs, key, value):
+    def mangle(doc):
+        doc["links"][0][key] = value
+    return mangle
+
+
+@pytest.mark.parametrize("tabs", [True, False], ids=["v2", "classic"])
+def test_readback_passes_when_the_links_come_back(tabs):
+    make = tabbed if tabs else plain
+    assert _problems(_with_links(make()), tabs=tabs) == []
+    assert _problems(_with_links(make(), LINKS_MIN), tabs=tabs) == []
+    assert _problems(make(), tabs=tabs) == [], "a board that declares none asks for none"
+
+
+@pytest.mark.parametrize("tabs", [True, False], ids=["v2", "classic"])
+def test_readback_fails_when_a_link_is_dropped(tabs):
+    got = _problems(_with_links(tabbed() if tabs else plain()), _drop_links(tabs), tabs=tabs)
+    assert got == ["links: read back 0, declared 2"], got
+
+
+@pytest.mark.parametrize("tabs", [True, False], ids=["v2", "classic"])
+def test_readback_fails_when_a_link_comes_back_changed_or_reordered(tabs):
+    make = tabbed if tabs else plain
+    [got] = _problems(_with_links(make()), _edit_link(tabs, "url", "https://elsewhere.invalid"),
+                      tabs=tabs)
+    assert got.startswith("link 0 ('Record AUM') url: read back 'https://elsewhere.invalid'"), got
+    swap = ((lambda spec: spec["links"].reverse()) if tabs
+            else (lambda board: board["links"].reverse()))
+    got = _problems(_with_links(make()), swap, tabs=tabs)
+    assert len(got) >= 2 and all(p.startswith("link ") for p in got), got
+
+
+def test_a_converter_that_drops_links_cannot_pass(monkeypatch):
+    """The 0.4.0 incident: the converter wrote `links: []`, Grafana stored what it was sent,
+    and the deploy said "in sync" without the Record AUM link. The expectation comes from the
+    classic board, never from to_v2's output, so the broken converter cannot agree with itself."""
+    real = publish.to_v2
+
+    def dropping(board, folder_uid=None):
+        res = real(board, folder_uid)
+        res["spec"]["links"] = []
+        return res
+
+    monkeypatch.setattr(publish, "to_v2", dropping)
+    got = _problems(_with_links(tabbed()))
+    assert got == ["links: read back 0, declared 2"], got
